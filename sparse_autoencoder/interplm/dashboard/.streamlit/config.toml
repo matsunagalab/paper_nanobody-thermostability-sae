@@ -1,0 +1,8 @@
+[theme]
+primaryColor = "#cc39ca" # "#611250"  # Pink
+backgroundColor = "#FFFFFF"  # White
+secondaryBackgroundColor = "#f0dfec" #f0f0f0"  # Light gray
+textColor = "#000000"  # Black
+
+[global]
+showWarningOnDirectExecution = false

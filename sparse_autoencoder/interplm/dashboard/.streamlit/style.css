@@ -1,0 +1,65 @@
+/* Keep main title at original size but reduce other headers */
+.block-container h1:first-of-type {
+    font-size: 2rem !important;
+}
+/* Set h2 size for main content */
+.block-container h2 {
+    font-size: 24px !important;
+}
+/* Set h2 size specifically for sidebar */
+section[data-testid="stSidebar"] h2 {
+    font-size: 18px !important;
+}
+/* Reduce size for all other headers */
+h3, h4, h5, h6 {
+    font-size: 16px !important;
+}
+/* Reduce font size for all regular text and widgets */
+.stMarkdown p,
+.stButton,
+.stSelectbox,
+.stText,
+.stNumber,
+.stTextInput > label,
+.stSelectbox > label,
+.stSlider > label {
+    font-size: 14px !important;
+}
+/* Reduce button size */
+.stButton button {
+    padding: 0.2rem 1rem;
+    font-size: 14px;
+}
+/* Adjust sidebar width */
+section[data-testid="stSidebar"] {
+    width: 250px !important;
+}
+/* Reduce padding in main content and sidebar */
+.block-container, section[data-testid="stSidebar"] .block-container {
+    padding-top: 2rem;
+    padding-bottom: 1rem;
+    margin-top: 0rem;
+}
+/* Make dataframes and tables more compact */
+.dataframe {
+    font-size: 12px !important;
+}
+/* Reduce size of radio buttons and checkboxes */
+.stRadio, .stCheckbox {
+    font-size: 14px !important;
+}
+
+/* Sidebar button styles */
+.stButton button {
+    background-color: #cc39ca;
+    color: white !important;
+    font-size: 12px;
+    padding: 10px 14px;
+    width: 100%;
+    border-radius: 8px;
+}
+.stButton button:hover {
+    background-color: #00DDFF;
+    border-color: #00DDFF;
+    color: black !important;
+}
