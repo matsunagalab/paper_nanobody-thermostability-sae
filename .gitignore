@@ -168,6 +168,7 @@ slurm-*.out
 models/
 outputs/
 figure/
+fep/
 
 # Data
 data/cif/*
@@ -189,6 +190,7 @@ data/pdbs/*
 *.npz
 *.txt
 *.gz
+*.tgz
 
 # shell scripts
 *.sh
