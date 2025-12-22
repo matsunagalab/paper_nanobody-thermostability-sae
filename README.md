@@ -7,6 +7,8 @@ This repository contains code for predicting nanobody thermostability using prot
 1. **Supervised Fine-tuning** (`supervised_finetuning/`): Code for fine-tuning pre-trained pLMs (e.g., ESM-2) on nanobody thermostability regression tasks.
 2. **Sparse Autoencoder (SAE) Analysis** (`sparse_autoencoder/`): Code for interpreting fine-tuned pLMs using sparse autoencoders to extract and analyze interpretable features.
 
+Our implementation builds upon the sparse autoencoder (SAE) framework of Simon and Zou (see their original code at https://github.com/ElanaPearl/InterPLM) and incorporates only minor rather than major structural changes. Code related to InterPLM is subject to the license terms of the original InterPLM repository.
+
 Each component requires a different Python environment, managed via Conda environment files (`env.yml`) located in their respective directories.
 
 ## Requirements
@@ -112,50 +114,13 @@ python plm_supervised_fine_tuning.py \
     --val_data_path ../data/nbthermo/vhh_tm_dataset_validation.csv \
     --model_path facebook/esm2_t6_8M_UR50D \
     --tokenizer_path facebook/esm2_t6_8M_UR50D \
-    --output_dir ./models/esm2_8m_finetuned \
+    --output_dir ./models/esm2_8m_base-sft/encoder_lr_5e-5_batch_size_16_encoder_weight_decay_0.0001 \
     --embedding_type mean \
     --head_type ridge \
     --head_lr 0.1 \
     --head_weight_decay 0.01 \
     --head_lr 5e-05 \
     --head_weight_decay 0.0001 \
-    --num_train_epochs 50 \
-    --batch_size 16
-```
-
-**Fine-tuning with LoRA:**
-
-```bash
-conda activate esm
-cd supervised_finetuning
-
-python plm_supervised_fine_tuning.py \
-    --train_data_path ../data/nbthermo/vhh_tm_dataset_train.csv \
-    --val_data_path ../data/nbthermo/vhh_tm_dataset_validation.csv \
-    --model_path facebook/esm2_t6_8M_UR50D \
-    --tokenizer_path facebook/esm2_t6_8M_UR50D \
-    --output_dir ./outputs/esm2_8m_lora \
-    --use_lora \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --num_train_epochs 50 \
-    --batch_size 16
-```
-
-**With hyperparameter optimization:**
-
-```bash
-conda activate esm
-cd supervised_finetuning
-
-python plm_supervised_fine_tuning.py \
-    --train_data_path ../data/nbthermo/vhh_tm_dataset_train.csv \
-    --val_data_path ../data/nbthermo/vhh_tm_dataset_validation.csv \
-    --model_path facebook/esm2_t6_8M_UR50D \
-    --tokenizer_path facebook/esm2_t6_8M_UR50D \
-    --output_dir ./outputs/esm2_8m_optimized \
-    --optimize \
-    --n_trials 100 \
     --num_train_epochs 50 \
     --batch_size 16
 ```
@@ -190,21 +155,7 @@ Use `fasta_to_sae_dataset.py` to generate embedding data from FASTA files for tr
 
 **Example Commands**:
 
-For pretrained model:
-```bash
-conda activate interplm
-cd sparse_autoencoder
-
-python interplm/esm/fasta_to_sae_dataset.py \
-    --fasta_dir ../data/indi \
-    --output_dir ./ngs/embeddings/pretrained_8m \
-    --esm_model_name esm2_t6_8M_UR50D \
-    --disable_chunking \
-    --start_shard 0 \
-    --end_shard 0
-```
-
-For fine-tuned model:
+For supervised_finetuning(SFT) model:
 ```bash
 conda activate interplm
 cd sparse_autoencoder
@@ -245,15 +196,7 @@ Use `train_plm_sae.py` to train a sparse autoencoder on the generated embeddings
 conda activate interplm
 cd sparse_autoencoder
 
-# Train SAE for pretrained model
-python interplm/train/train_plm_sae.py \
-    --plm_embd_dir ./ngs/embeddings/pretrained_8m/layer_6 \
-    --save_dir ./models/pretrained_8m_100k/expansion_32_lr_9e-5_l1_5e-2/layer_6 \
-    --expansion_factor 32 \
-    --lr 9e-5 \
-    --l1_penalty 5e-2
-
-# Train SAE for fine-tuned model
+# Train SAE for SFT model
 python interplm/train/train_plm_sae.py \
     --plm_embd_dir ./ngs/embeddings/sft_8m/layer_6 \
     --save_dir ./models/sft_8m_100k/expansion_32_lr_9e-5_l1_5e-2/layer_6 \
@@ -276,19 +219,7 @@ Use `single_sequence_activations.py` to generate dense embeddings from FASTA fil
 
 **Example Commands**:
 
-For pretrained model:
-```bash
-conda activate interplm
-cd sparse_autoencoder
-
-python interplm/esm/single_sequence_activations.py \
-    --fasta_file ../data/nbthermo/vhh_tm_dataset.fasta \
-    --output_dir ./interplm/nbthermo/nbthermo_embedding_esm_pretrained_8m \
-    --layers 6 \
-    --process_all
-```
-
-For fine-tuned model:
+For SFT model:
 ```bash
 conda activate interplm
 cd sparse_autoencoder
@@ -322,15 +253,7 @@ Use `convert_to_sparse.py` to convert dense activations to sparse representation
 conda activate interplm
 cd sparse_autoencoder
 
-# Convert for pretrained model
-python interplm/esm/convert_to_sparse.py \
-    --activation_dir ./interplm/nbthermo/nbthermo_embedding_esm_pretrained_8m \
-    --output_dir ./interplm/nbthermo/nbthermo_embedding_sparse_pretrained_8m_expansion_32_lr_9e-5_l1_5e-2 \
-    --target_layers 6 \
-    --sae_weight_file ./models/pretrained_8m_100k/expansion_32_lr_9e-5_l1_5e-2/layer_6/ae.pt \
-    --all_layers 6
-
-# Convert for fine-tuned model
+# Convert for SFT model
 python interplm/esm/convert_to_sparse.py \
     --activation_dir ./interplm/nbthermo/nbthermo_embedding_esm_sft_8m \
     --output_dir ./interplm/nbthermo/nbthermo_embedding_sparse_sft_8m_expansion_32_lr_9e-5_l1_5e-2 \
@@ -360,14 +283,7 @@ Use `analyze_sae.py` to analyze sparse activation features for protein thermal s
 conda activate interplm
 cd sparse_autoencoder
 
-# Analyze pretrained model
-python analyze_sae.py \
-    --data-dir ./interplm/nbthermo/nbthermo_embedding_esm_pretrained_8m \
-    --sparse-dir ./interplm/nbthermo/nbthermo_embedding_sparse_pretrained_8m_expansion_32_lr_9e-5_l1_5e-2 \
-    --tm-data ../data/nbthermo/vhh_tm_dataset.csv \
-    --output-dir ./outputs/pretrained_8m_100k_expansion_32_lr_9e-5_l1_5e-2
-
-# Analyze fine-tuned model
+# Analyze SFT model
 python analyze_sae.py \
     --data-dir ./interplm/nbthermo/nbthermo_embedding_esm_sft_8m \
     --sparse-dir ./interplm/nbthermo/nbthermo_embedding_sparse_sft_8m_expansion_32_lr_9e-5_l1_5e-2 \
