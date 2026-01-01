@@ -24,7 +24,7 @@ This project uses **two separate Conda environments** due to different dependenc
 
 1. **`esm` environment** (for supervised fine-tuning)
    - Environment file: `supervised_finetuning/env.yml`
-   - Includes: PyTorch, Transformers, ESM, Optuna, PEFT (LoRA), etc.
+   - Includes: PyTorch, Transformers, ESM, Optuna, PEFT, etc.
 
 2. **`interplm` environment** (for SAE analysis)
    - Environment file: `sparse_autoencoder/env.yml`
@@ -79,20 +79,6 @@ The main script is `plm_supervised_fine_tuning.py`, which fine-tunes a pre-train
 - `--max_length`: Maximum sequence length for tokenization (default: `256`)
 - `--seed`: Random seed for reproducibility (default: `42`)
 
-#### LoRA Fine-tuning
-
-For parameter-efficient fine-tuning using LoRA:
-
-- `--use_lora`: Enable LoRA fine-tuning
-- `--lora_r`: LoRA rank (default: `16`)
-- `--lora_alpha`: LoRA scaling factor (default: `32`)
-- `--lora_dropout`: LoRA dropout probability (default: `0.2`)
-
-#### Hyperparameter Optimization
-
-- `--optimize`: Enable Optuna-based hyperparameter optimization for encoder/LoRA parameters
-- `--n_trials`: Number of Optuna trials (default: `100`)
-
 #### Learning Rate and Regularization
 
 - `--encoder_lr`: Learning rate for the encoder (default: `1e-4`)
@@ -103,7 +89,7 @@ For parameter-efficient fine-tuning using LoRA:
 
 #### Example Commands
 
-**Basic fine-tuning without LoRA:**
+**Basic fine-tuning:**
 
 ```bash
 conda activate esm
@@ -314,4 +300,4 @@ Refer to the `sparse_autoencoder/README.md` for more detailed information about 
    - `sequence_aho_ungapped`: Protein sequence strings
    - `tm`: Numeric thermostability values (target variable)
 
-4. **Output Structure**: Fine-tuned models are saved with separate directories for the encoder and regression head. When using LoRA, adapters are saved relative to the base model for easy reloading.
+4. **Output Structure**: Fine-tuned models are saved with separate directories for the encoder and regression head.
