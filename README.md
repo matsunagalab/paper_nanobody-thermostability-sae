@@ -62,13 +62,25 @@ cd ..
 
 The main script is `plm_supervised_fine_tuning.py`, which fine-tunes a pre-trained protein language model for regression tasks.
 
+#### Data source (default: Hugging Face)
+
+By default, the script loads **train** and **validation** splits from the Hugging Face dataset [ZYMScott/thermo-seq](https://huggingface.co/datasets/ZYMScott/thermo-seq). No CSV paths are required.
+
+To use your own CSV files instead, set both `--train_data_path` and `--val_data_path`, and optionally `--label_column` and `--text_column` to match your CSV column names (see below).
+
 #### Required Arguments
 
-- `--train_data_path`: Path to the training CSV file (must contain `sequence_aho_ungapped` and `tm` columns)
-- `--val_data_path`: Path to the validation CSV file (same format as training data)
 - `--model_path`: Hugging Face Hub model identifier or local path to the pre-trained base model
 - `--tokenizer_path`: Path to the tokenizer
 - `--output_dir`: Directory where the trained model and results will be saved
+
+#### Data Arguments (optional)
+
+- `--train_data_path`: Path to the training CSV file. Omit to use the Hugging Face dataset.
+- `--val_data_path`: Path to the validation CSV file. Must be set together with `--train_data_path`.
+- `--dataset_name`: Hugging Face dataset name when not using CSV (default: `ZYMScott/thermo-seq`).
+- `--label_column`: CSV column name for the target / thermostability (default: `tm`). Used only with CSV.
+- `--text_column`: CSV column name for the protein sequence (default: `sequence_aho_ungapped`). Used only with CSV.
 
 #### Common Optional Arguments
 
@@ -89,15 +101,30 @@ The main script is `plm_supervised_fine_tuning.py`, which fine-tunes a pre-train
 
 #### Example Commands
 
-**Basic fine-tuning:**
+**Default: fine-tuning with Hugging Face dataset (ZYMScott/thermo-seq):**
 
 ```bash
 conda activate esm
 cd supervised_finetuning
 
 python plm_supervised_fine_tuning.py \
+    --model_path facebook/esm2_t6_8M_UR50D \
+    --tokenizer_path facebook/esm2_t6_8M_UR50D \
+    --output_dir ./models/esm2_8m_thermo-seq \
+    --embedding_type mean \
+    --head_type ridge \
+    --num_train_epochs 50 \
+    --batch_size 16
+```
+
+**Using your own CSV files** (with optional column names):
+
+```bash
+python plm_supervised_fine_tuning.py \
     --train_data_path ../data/nbthermo/vhh_tm_dataset_train.csv \
     --val_data_path ../data/nbthermo/vhh_tm_dataset_validation.csv \
+    --label_column tm \
+    --text_column sequence_aho_ungapped \
     --model_path facebook/esm2_t6_8M_UR50D \
     --tokenizer_path facebook/esm2_t6_8M_UR50D \
     --output_dir ./models/esm2_8m_base-sft/encoder_lr_5e-5_batch_size_16_encoder_weight_decay_0.0001 \
@@ -111,7 +138,7 @@ python plm_supervised_fine_tuning.py \
     --batch_size 16
 ```
 
-**Note**: The script expects CSV files with columns `sequence_aho_ungapped` (protein sequences) and `tm` (thermostability target values).
+**Note**: When using CSV, the files must contain a sequence column and a numeric target column. Use `--label_column` and `--text_column` if your column names differ from `tm` and `sequence_aho_ungapped`.
 
 ### 3. Running SAE Analysis
 

@@ -6,8 +6,11 @@
 A script to fine-tune a pre-trained model for protein sequence regression tasks.
 
 Overview:
-1.  **Data Loading**: Loads a CSV file containing protein sequences and their corresponding
-    target variables (e.g., thermal stability 'tm').
+1.  **Data Loading**: By default loads the Hugging Face dataset ZYMScott/thermo-seq
+    (train and validation splits). Alternatively, you can provide custom CSV files
+    via --train_data_path and --val_data_path; in that case use --label_column and
+    --text_column to specify the column names for the target (e.g. thermal stability)
+    and the sequence.
 2.  **Model Construction**:
     -   Loads a pre-trained Transformer model (e.g., ESM-2) from the Hugging Face Hub
         as the base encoder.
@@ -36,10 +39,17 @@ Overview:
     -   If Optuna was used, the best parameters for the encoder are saved to a JSON file.
 
 Command-line Arguments:
-    --train_data_path (str, required):
-        Path to the CSV file for training.
-    --val_data_path (str, required):
-        Path to the CSV file for validation.
+    --train_data_path (str, optional):
+        Path to the CSV file for training. If omitted (with --val_data_path), data is
+        loaded from the Hugging Face dataset (see --dataset_name).
+    --val_data_path (str, optional):
+        Path to the CSV file for validation. Must be used together with --train_data_path.
+    --dataset_name (str):
+        Hugging Face dataset name for train/validation when not using CSV. Default: "ZYMScott/thermo-seq"
+    --label_column (str):
+        CSV column name for the target (e.g. tm / thermal stability). Used only with CSV. Default: "tm"
+    --text_column (str):
+        CSV column name for the sequence. Used only with CSV. Default: "sequence_aho_ungapped"
     --model_path (str, required):
         Name on the Hugging Face Hub or local path to the pre-trained base model.
     --tokenizer_path (str, required):
@@ -72,7 +82,7 @@ Command-line Arguments:
         The LoRA scaling factor (alpha). Default: 32
     --lora_dropout (float):
         The dropout probability for LoRA layers. Default: 0.2
-    
+
     # Head hyperparameters
     --head_lr (float):
         Learning rate for the regression head. Default: 1e-3
@@ -82,7 +92,7 @@ Command-line Arguments:
         Dropout rate for the regression head. Default: 0.2
     --head_activate_fnc (str):
         Activation function for the regression head. Default: "ReLU"
-    
+
     # Encoder hyperparameters
     --encoder_lr (float):
         Learning rate for the encoder. Default: 1e-4
@@ -104,7 +114,7 @@ import torch
 import torch.nn.functional as F
 from transformers import Trainer, TrainingArguments, AutoModel, AutoTokenizer
 from transformers.modeling_outputs import SequenceClassifierOutput
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 import optuna
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from safetensors.torch import save_file
@@ -212,7 +222,7 @@ class CustomTrainer(Trainer):
         self.encoder_params = encoder_params if encoder_params is not None else {}
     
     def compute_loss(self, model, inputs, return_outputs=False):
-        outputs = model(**inputs)  # labels は inputs 内に含まれている
+        outputs = model(**inputs)  # labels are included in inputs
         loss = outputs.loss if hasattr(outputs,'loss') else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
@@ -248,6 +258,19 @@ def compute_metrics(pred):
     preds  = pred.predictions.reshape(-1)
     mse = mean_squared_error(labels, preds)
     return {"mse":mse, "rmse":np.sqrt(mse), "mae":mean_absolute_error(labels,preds), "r2":r2_score(labels,preds)}
+
+
+def clean_dataframe(df: pd.DataFrame, label_column: str = "tm", text_column: str = "sequence_aho_ungapped") -> pd.DataFrame:
+    """Normalize CSV columns to 'text' and 'labels', drop nulls. Used only when loading from CSV."""
+    df = df.rename(columns={label_column: "labels", text_column: "text"})
+    if "text" not in df.columns or "labels" not in df.columns:
+        raise KeyError(f"CSV must contain columns '{label_column}' (or 'labels') and '{text_column}' (or 'text').")
+    df["labels"] = pd.to_numeric(df["labels"], errors="coerce")
+    df["text"] = df["text"].astype(str).str.strip()
+    df.loc[df["text"] == "", "text"] = np.nan
+    df.dropna(subset=["labels", "text"], inplace=True)
+    return df
+
 
 # --- Build model ----------------------------------------------------------------
 
@@ -328,11 +351,12 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
 
     # Train the model
     train_result = trainer.train()
-    
+
     # Evaluate the model
     result = trainer.evaluate()
 
     # Clean up trial directory completely
+    trial_checkpoint_dir = training_args.output_dir
     if os.path.exists(trial_checkpoint_dir):
         shutil.rmtree(trial_checkpoint_dir)
         print(f"[Trial {trial.number}] Removed trial directory: {trial_checkpoint_dir}")
@@ -422,7 +446,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
         trained_model.encoder.save_pretrained(encoder_dir)
     else:
         print("Saving transformer backbone …")
-        trained_model.encoder.save_pretrained(encoder_dir) # モデルの状態辞書からencoder部分のみを抽出
+        trained_model.encoder.save_pretrained(encoder_dir)
 
     # Save tokenizer
     print("Saving tokenizer …")
@@ -430,14 +454,13 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
     
     # Save head weights separately
     print("Saving head weights …")
-    # モデルの状態辞書からhead部分のみを抽出
+    # Extract only the head submodule from the full state dict
     full_state_dict = trained_model.state_dict()
     head_state_dict = {}
-    
+
     for key, value in full_state_dict.items():
         if key.startswith('head.'):
-            # head.プレフィックスを除去
-            head_key = key[5:]  # 'head.'の5文字を除去
+            head_key = key[5:]  # Remove 'head.' prefix
             head_state_dict[head_key] = value
     
     print(f"Head state dict keys: {list(head_state_dict.keys())}")
@@ -500,8 +523,11 @@ def main():
     )
 
     # Data / model paths
-    parser.add_argument("--train_data_path", type=str, required=True)
-    parser.add_argument("--val_data_path", type=str, required=True)
+    parser.add_argument("--train_data_path", type=str, default=None, help="Path to training CSV. Omit to use Hugging Face dataset.")
+    parser.add_argument("--val_data_path", type=str, default=None, help="Path to validation CSV. Must set with --train_data_path when using CSV.")
+    parser.add_argument("--dataset_name", type=str, default="ZYMScott/thermo-seq", help="Hugging Face dataset name when not using CSV.")
+    parser.add_argument("--label_column", type=str, default="tm", help="CSV column name for target (e.g. tm). Used only with CSV.")
+    parser.add_argument("--text_column", type=str, default="sequence_aho_ungapped", help="CSV column name for sequence. Used only with CSV.")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -536,6 +562,12 @@ def main():
 
     args = parser.parse_args()
 
+    # Require both or neither of train_data_path and val_data_path
+    if args.train_data_path is not None and args.val_data_path is None:
+        raise ValueError("If --train_data_path is set, --val_data_path must also be set.")
+    if args.train_data_path is None and args.val_data_path is not None:
+        raise ValueError("If --val_data_path is set, --train_data_path must also be set.")
+
     # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -545,19 +577,6 @@ def main():
 
     # Data ----------------------------------------------------------------------
     print("--- Loading data …")
-    def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.rename(columns={"tm": "labels", "sequence_aho_ungapped": "text"})
-        if "text" not in df.columns or "labels" not in df.columns:
-            raise KeyError("CSV file must contain 'seq' and 'tm' columns.")
-        df["labels"] = pd.to_numeric(df["labels"], errors="coerce")
-        df["text"] = df["text"].astype(str).str.strip()
-        df.loc[df["text"] == "", "text"] = np.nan
-        df.dropna(subset=["labels", "text"], inplace=True)
-        return df
-
-    df_train = clean_dataframe(pd.read_csv(args.train_data_path))
-    df_val = clean_dataframe(pd.read_csv(args.val_data_path))
-
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
     def tokenize_fn(examples):
@@ -568,17 +587,35 @@ def main():
             max_length=args.max_length,
         )
 
-    train_ds = Dataset.from_pandas(df_train).map(tokenize_fn, batched=True)
-    val_ds = Dataset.from_pandas(df_val).map(tokenize_fn, batched=True)
-    print(f"Dataset sizes – train: {len(train_ds)} | val: {len(val_ds)}")
+    if args.train_data_path is None and args.val_data_path is None:
+        # Load from Hugging Face dataset (default)
+        ds = load_dataset(args.dataset_name)
+        train_ds_raw = ds["train"]
+        val_ds_raw = ds["validation"]
+        # Map columns: seq -> text, label -> labels (thermo-seq uses 'seq' and 'label')
+        train_ds_raw = train_ds_raw.rename_column("seq", "text").rename_column("label", "labels")
+        val_ds_raw = val_ds_raw.rename_column("seq", "text").rename_column("label", "labels")
+        # Drop rows with null labels or text if any
+        train_ds_raw = train_ds_raw.filter(lambda x: x["text"] is not None and x["labels"] is not None and str(x["text"]).strip() != "")
+        val_ds_raw = val_ds_raw.filter(lambda x: x["text"] is not None and x["labels"] is not None and str(x["text"]).strip() != "")
+        train_ds = train_ds_raw.map(tokenize_fn, batched=True)
+        val_ds = val_ds_raw.map(tokenize_fn, batched=True)
+        print(f"Loaded Hugging Face dataset '{args.dataset_name}' – train: {len(train_ds)} | val: {len(val_ds)}")
+    else:
+        # Load from CSV with user-specified column names
+        df_train = clean_dataframe(pd.read_csv(args.train_data_path), label_column=args.label_column, text_column=args.text_column)
+        df_val = clean_dataframe(pd.read_csv(args.val_data_path), label_column=args.label_column, text_column=args.text_column)
+        train_ds = Dataset.from_pandas(df_train).map(tokenize_fn, batched=True)
+        val_ds = Dataset.from_pandas(df_val).map(tokenize_fn, batched=True)
+        print(f"Dataset sizes – train: {len(train_ds)} | val: {len(val_ds)}")
 
     columns_to_use = ['input_ids', 'attention_mask', 'labels']
     train_ds.set_format(type='torch', columns=columns_to_use)
     val_ds.set_format(type='torch', columns=columns_to_use)
     print("Dataset format set to 'torch' with required columns only.")
 
-    # --- Hyper‑parameters -----------------------------------------------------------
-    # 1. Determine head parameters from command-line arguments
+    # --- Hyperparameters -----------------------------------------------------------
+    # 1. Head parameters from command-line
     head_params = {
         "lr": args.head_lr,
         "weight_decay": args.head_weight_decay,
@@ -587,7 +624,7 @@ def main():
     }
     params = {"head": head_params}
 
-    # 2. Determine encoder parameters from command-line arguments
+    # 2. Encoder parameters from command-line or Optuna
     if args.optimize:
         print("--- Optimizing encoder (and LoRA) hyperparameters with Optuna ---")
         sampler = optuna.samplers.TPESampler(seed=args.seed)
@@ -622,7 +659,7 @@ def main():
         print("Head params:", json.dumps(params['head'], indent=2))
         print("Encoder params:", json.dumps(params['encoder'], indent=2))
 
-    # 3. Start final training
+    # 3. Final training
     train_final(params, args, train_ds, val_ds, tokenizer)
     print("--- Done ---")
 
