@@ -70,6 +70,9 @@ Command-line Arguments:
         If set, enables hyperparameter optimization for encoder/LoRA. Default: False
     --n_trials (int):
         Number of trials for Optuna to run. Used only if `--optimize` is enabled. Default: 100
+    --n_gpus (int):
+        Number of GPUs for parallel Optuna trials. When > 1, trials are distributed across
+        GPUs via multiprocessing with shared SQLite storage. Default: 1
     --max_length (int):
         Maximum sequence length for tokenization. Longer sequences will be truncated. Default: 256
     --seed (int):
@@ -100,12 +103,14 @@ Command-line Arguments:
         Weight decay for the encoder. Default: 0.01
 """
 import os
+import sys
 import json
 import random
 import argparse
 import gc
 import glob
 import shutil
+import subprocess
 from copy import deepcopy
 
 import numpy as np
@@ -289,11 +294,44 @@ def build_model(base_model, head_params, args):
 # --- Optuna objective -----------------------------------------------------------
 
 def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
-    # Parameters to be tuned by Optuna
-    encoder_params = {
-        "lr": trial.suggest_float("encoder_lr", 1e-5, 1e-3),
-        "weight_decay": trial.suggest_float("encoder_weight_decay", 1e-4, 1e-1),
-    }
+    optuna_params = getattr(args, "optuna_params", None)
+    if optuna_params is None:
+        optuna_params = ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+
+    encoder_lr_min = getattr(args, "optuna_encoder_lr_min", 1e-5)
+    encoder_lr_max = getattr(args, "optuna_encoder_lr_max", 1e-3)
+    encoder_wd_min = getattr(args, "optuna_encoder_weight_decay_min", 1e-4)
+    encoder_wd_max = getattr(args, "optuna_encoder_weight_decay_max", 1e-1)
+
+    if "encoder_lr" in optuna_params:
+        encoder_lr = trial.suggest_float("encoder_lr", encoder_lr_min, encoder_lr_max)
+    else:
+        encoder_lr = args.encoder_lr
+    if "encoder_weight_decay" in optuna_params:
+        encoder_weight_decay = trial.suggest_float("encoder_weight_decay", encoder_wd_min, encoder_wd_max)
+    else:
+        encoder_weight_decay = args.encoder_weight_decay
+
+    encoder_params = {"lr": encoder_lr, "weight_decay": encoder_weight_decay}
+
+    trial_head_params = dict(head_params)
+    if "head_lr" in optuna_params:
+        h_lr_min = getattr(args, "optuna_head_lr_min", 1e-4)
+        h_lr_max = getattr(args, "optuna_head_lr_max", 1e-2)
+        trial_head_params["lr"] = trial.suggest_float("head_lr", h_lr_min, h_lr_max)
+    if "head_weight_decay" in optuna_params:
+        h_wd_min = getattr(args, "optuna_head_weight_decay_min", 0.0)
+        h_wd_max = getattr(args, "optuna_head_weight_decay_max", 0.1)
+        trial_head_params["weight_decay"] = trial.suggest_float("head_weight_decay", h_wd_min, h_wd_max)
+
+    if "batch_size" in optuna_params:
+        batch_size_str = getattr(args, "optuna_batch_size", "8,16,32")
+        batch_choices = [int(x.strip()) for x in batch_size_str.split(",") if x.strip()]
+        if not batch_choices:
+            batch_choices = [8, 16, 32]
+        trial_batch_size = trial.suggest_categorical("batch_size", batch_choices)
+    else:
+        trial_batch_size = args.batch_size
 
     base_model = AutoModel.from_pretrained(args.model_path)
     trial_args = deepcopy(args)
@@ -302,23 +340,42 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
         if get_peft_model is None:
             raise ImportError("peft is not installed but --use_lora was passed.")
         
-        # Tune LoRA parameters
-        trial_args.lora_r = trial.suggest_categorical("lora_r", [4, 8, 16, 32])
-        trial_args.lora_alpha = trial.suggest_categorical("lora_alpha", [16, 32, 64, 128])
-        trial_args.lora_dropout = trial.suggest_float("lora_dropout", 0.0, 0.5)
+        lora_r_str = getattr(args, "optuna_lora_r", "4,8,16,32")
+        lora_alpha_str = getattr(args, "optuna_lora_alpha", "16,32,64,128")
+        lora_r_choices = [int(x.strip()) for x in lora_r_str.split(",") if x.strip()]
+        lora_alpha_choices = [int(x.strip()) for x in lora_alpha_str.split(",") if x.strip()]
+        lora_dropout_min = getattr(args, "optuna_lora_dropout_min", 0.0)
+        lora_dropout_max = getattr(args, "optuna_lora_dropout_max", 0.5)
+        if not lora_r_choices:
+            lora_r_choices = [4, 8, 16, 32]
+        if not lora_alpha_choices:
+            lora_alpha_choices = [16, 32, 64, 128]
+
+        if "lora_r" in optuna_params:
+            trial_args.lora_r = trial.suggest_categorical("lora_r", lora_r_choices)
+        else:
+            trial_args.lora_r = args.lora_r
+        if "lora_alpha" in optuna_params:
+            trial_args.lora_alpha = trial.suggest_categorical("lora_alpha", lora_alpha_choices)
+        else:
+            trial_args.lora_alpha = args.lora_alpha
+        if "lora_dropout" in optuna_params:
+            trial_args.lora_dropout = trial.suggest_float("lora_dropout", lora_dropout_min, lora_dropout_max)
+        else:
+            trial_args.lora_dropout = args.lora_dropout
         
         lora_cfg = get_lora_config(trial_args, base_model)
         base_model = get_peft_model(base_model, lora_cfg)
         base_model.print_trainable_parameters()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(base_model, head_params, trial_args).to(device)
+    model = build_model(base_model, trial_head_params, trial_args).to(device)
 
     training_args = TrainingArguments(
         output_dir=f"{args.output_dir}/trial_{trial.number}",
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_train_batch_size=trial_batch_size,
+        per_device_eval_batch_size=trial_batch_size,
         evaluation_strategy="epoch",
         save_strategy="epoch",
         learning_rate=1e-4,  # Dummy value, will be overridden by CustomTrainer
@@ -341,7 +398,7 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
         eval_dataset=eval_ds,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
-        head_params=head_params,
+        head_params=trial_head_params,
         encoder_params=encoder_params,
     )   
 
@@ -369,14 +426,33 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
     return result.get("eval_loss", float("inf"))
 
 
+# --- Worker for multi-GPU Optuna (subprocess sets CUDA before torch import) ---
+
+OPTUNA_STUDY_NAME = "plm_sft_study"
+# Param names that can be passed to --optuna_params (lora_* only valid when --use_lora)
+OPTUNA_PARAM_NAMES = ("encoder_lr", "encoder_weight_decay", "head_lr", "head_weight_decay", "batch_size", "lora_r", "lora_alpha", "lora_dropout")
+
+
+# run_optimization_worker is only used for the doc/flow; actual multi-GPU uses subprocess.
+def run_optimization_worker(gpu_id, storage_url, n_trials_this_worker, args, train_ds, eval_ds, head_params, tokenizer):
+    """Run Optuna optimization in a worker process bound to a single GPU (used when invoked as subprocess)."""
+    study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=storage_url)
+    study.optimize(
+        lambda t: objective(t, args, train_ds, eval_ds, head_params, tokenizer),
+        n_trials=n_trials_this_worker,
+    )
+
+
 # --- Final training & saving ----------------------------------------------------
 
 def train_final(params, args, train_ds, eval_ds, tokenizer):
     print("--- Starting final model training ---")
     encoder_params = params.get("encoder", {})
     head_params = params.get("head", {})
+    batch_size = params.get("batch_size", args.batch_size)
     print("Encoder params:", json.dumps(encoder_params, indent=2))
     print("Head params:", json.dumps(head_params, indent=2))
+    print("Batch size:", batch_size)
 
     base_model = AutoModel.from_pretrained(args.model_path)
     final_args = deepcopy(args)
@@ -397,8 +473,8 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
     training_args = TrainingArguments(
         output_dir=ckpt_dir,
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
         evaluation_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="epoch",
@@ -492,7 +568,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
     # Add training information to params
     training_info = {
         "epochs": args.num_train_epochs,
-        "batch_size": args.batch_size
+        "batch_size": params.get("batch_size", args.batch_size)
     }
     params["training_info"] = training_info
     
@@ -541,8 +617,28 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--optimize", action="store_true", help="Enable Optuna optimization for encoder/LoRA.")
     parser.add_argument("--n_trials", type=int, default=100)
+    parser.add_argument("--n_gpus", type=int, default=1, help="Number of GPUs for parallel Optuna trials (only when --optimize). Default: 1")
+    # Optuna search space (used only when --optimize)
+    parser.add_argument("--optuna_encoder_lr_min", type=float, default=1e-5, help="Optuna: encoder LR lower bound (default: 1e-5)")
+    parser.add_argument("--optuna_encoder_lr_max", type=float, default=1e-3, help="Optuna: encoder LR upper bound (default: 1e-3)")
+    parser.add_argument("--optuna_encoder_weight_decay_min", type=float, default=1e-4, help="Optuna: encoder weight_decay lower bound (default: 1e-4)")
+    parser.add_argument("--optuna_encoder_weight_decay_max", type=float, default=1e-1, help="Optuna: encoder weight_decay upper bound (default: 1e-1)")
+    parser.add_argument("--optuna_lora_r", type=str, default="4,8,16,32", help="Optuna: LoRA r candidates, comma-separated (default: 4,8,16,32). Used only with --use_lora.")
+    parser.add_argument("--optuna_lora_alpha", type=str, default="16,32,64,128", help="Optuna: LoRA alpha candidates, comma-separated (default: 16,32,64,128). Used only with --use_lora.")
+    parser.add_argument("--optuna_lora_dropout_min", type=float, default=0.0, help="Optuna: LoRA dropout lower bound (default: 0.0). Used only with --use_lora.")
+    parser.add_argument("--optuna_lora_dropout_max", type=float, default=0.5, help="Optuna: LoRA dropout upper bound (default: 0.5). Used only with --use_lora.")
+    parser.add_argument("--optuna_head_lr_min", type=float, default=1e-4, help="Optuna: head LR lower bound (default: 1e-4). Used when head_lr is in --optuna_params.")
+    parser.add_argument("--optuna_head_lr_max", type=float, default=1e-2, help="Optuna: head LR upper bound (default: 1e-2). Used when head_lr is in --optuna_params.")
+    parser.add_argument("--optuna_head_weight_decay_min", type=float, default=0.0, help="Optuna: head weight_decay lower bound (default: 0.0). Used when head_weight_decay is in --optuna_params.")
+    parser.add_argument("--optuna_head_weight_decay_max", type=float, default=0.1, help="Optuna: head weight_decay upper bound (default: 0.1). Used when head_weight_decay is in --optuna_params.")
+    parser.add_argument("--optuna_batch_size", type=str, default="8,16,32", help="Optuna: batch_size candidates, comma-separated (default: 8,16,32). Used when batch_size is in --optuna_params.")
+    parser.add_argument("--optuna_params", nargs="*", default=None, metavar="PARAM",
+        help="Which parameters to optimize. Choices: encoder_lr, encoder_weight_decay, head_lr, head_weight_decay, batch_size, lora_r, lora_alpha, lora_dropout (lora_* require --use_lora). Default: encoder_lr encoder_weight_decay, plus lora_r lora_alpha lora_dropout when --use_lora.")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    # Internal: used when this script is run as an Optuna worker subprocess (do not set manually)
+    parser.add_argument("--optuna_storage", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--optuna_n_trials_this_worker", type=int, default=None, help=argparse.SUPPRESS)
 
     # -------- LoRA options (default: disabled) ----------------------------------
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA fine‑tuning")
@@ -567,6 +663,37 @@ def main():
         raise ValueError("If --train_data_path is set, --val_data_path must also be set.")
     if args.train_data_path is None and args.val_data_path is not None:
         raise ValueError("If --val_data_path is set, --train_data_path must also be set.")
+
+    if args.optimize:
+        if args.optuna_encoder_lr_min > args.optuna_encoder_lr_max:
+            raise ValueError("optuna_encoder_lr_min must be <= optuna_encoder_lr_max")
+        if args.optuna_encoder_weight_decay_min > args.optuna_encoder_weight_decay_max:
+            raise ValueError("optuna_encoder_weight_decay_min must be <= optuna_encoder_weight_decay_max")
+        optuna_params = args.optuna_params if args.optuna_params is not None else (
+            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+        )
+        for p in optuna_params:
+            if p not in OPTUNA_PARAM_NAMES:
+                raise ValueError(f"Invalid --optuna_params value: {p}. Choices: {list(OPTUNA_PARAM_NAMES)}")
+            if p in ("lora_r", "lora_alpha", "lora_dropout") and not args.use_lora:
+                raise ValueError(f"--optuna_params {p} requires --use_lora")
+        if "head_lr" in optuna_params and args.optuna_head_lr_min > args.optuna_head_lr_max:
+            raise ValueError("optuna_head_lr_min must be <= optuna_head_lr_max when head_lr is in --optuna_params")
+        if "head_weight_decay" in optuna_params and args.optuna_head_weight_decay_min > args.optuna_head_weight_decay_max:
+            raise ValueError("optuna_head_weight_decay_min must be <= optuna_head_weight_decay_max when head_weight_decay is in --optuna_params")
+        if "batch_size" in optuna_params:
+            batch_vals = [int(x.strip()) for x in args.optuna_batch_size.split(",") if x.strip()]
+            if not batch_vals:
+                raise ValueError("optuna_batch_size must contain at least one integer (e.g. 8,16,32) when batch_size is in --optuna_params")
+        if args.use_lora:
+            lora_r_vals = [int(x.strip()) for x in args.optuna_lora_r.split(",") if x.strip()]
+            lora_alpha_vals = [int(x.strip()) for x in args.optuna_lora_alpha.split(",") if x.strip()]
+            if not lora_r_vals:
+                raise ValueError("optuna_lora_r must contain at least one integer (e.g. 4,8,16,32)")
+            if not lora_alpha_vals:
+                raise ValueError("optuna_lora_alpha must contain at least one integer (e.g. 16,32,64,128)")
+            if args.optuna_lora_dropout_min > args.optuna_lora_dropout_max:
+                raise ValueError("optuna_lora_dropout_min must be <= optuna_lora_dropout_max")
 
     # Seeding
     random.seed(args.seed)
@@ -624,24 +751,82 @@ def main():
     }
     params = {"head": head_params}
 
+    # Worker mode: run only Optuna trials then exit (used when launched as subprocess for multi-GPU)
+    if getattr(args, "optuna_storage", None) is not None and getattr(args, "optuna_n_trials_this_worker", None) is not None:
+        print("--- Optuna worker mode: running trials then exiting ---")
+        study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=args.optuna_storage)
+        study.optimize(
+            lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer),
+            n_trials=args.optuna_n_trials_this_worker,
+        )
+        sys.exit(0)
+
     # 2. Encoder parameters from command-line or Optuna
     if args.optimize:
         print("--- Optimizing encoder (and LoRA) hyperparameters with Optuna ---")
-        sampler = optuna.samplers.TPESampler(seed=args.seed)
-        study = optuna.create_study(direction="minimize", sampler=sampler, pruner=optuna.pruners.MedianPruner())
-        study.optimize(lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer), n_trials=args.n_trials)
-        
-        best_hyperparams = study.best_trial.params
+        n_gpus = min(args.n_gpus, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+        if n_gpus <= 0:
+            n_gpus = 1
 
-        # Save Optuna's best params
+        if n_gpus > 1:
+            # Multi-GPU: shared storage + one subprocess per GPU (env set before import)
+            os.makedirs(args.output_dir, exist_ok=True)
+            storage_path = os.path.abspath(os.path.join(args.output_dir, "optuna_study.db"))
+            storage_url = f"sqlite:///{storage_path}"
+            sampler = optuna.samplers.TPESampler(seed=args.seed)
+            study = optuna.create_study(
+                direction="minimize",
+                sampler=sampler,
+                pruner=optuna.pruners.MedianPruner(),
+                storage=storage_url,
+                study_name=OPTUNA_STUDY_NAME,
+                load_if_exists=False,
+            )
+            n_trials_base = args.n_trials // n_gpus
+            remainder = args.n_trials % n_gpus
+            procs = []
+            for i in range(n_gpus):
+                n_trials_i = n_trials_base + (1 if i < remainder else 0)
+                env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(i)}
+                cmd = [sys.executable, "-u", __file__] + sys.argv[1:] + [
+                    "--optuna_storage", storage_url,
+                    "--optuna_n_trials_this_worker", str(n_trials_i),
+                ]
+                p = subprocess.Popen(cmd, env=env)
+                procs.append(p)
+            for p in procs:
+                p.wait()
+                if p.returncode != 0:
+                    raise RuntimeError(f"Optuna worker process exited with code {p.returncode}")
+            study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=storage_url)
+            best_hyperparams = study.best_trial.params
+            print(f"Multi-GPU Optuna finished ({n_gpus} workers, {args.n_trials} trials total).")
+        else:
+            # Single-GPU: current in-process optimization
+            sampler = optuna.samplers.TPESampler(seed=args.seed)
+            study = optuna.create_study(direction="minimize", sampler=sampler, pruner=optuna.pruners.MedianPruner())
+            study.optimize(lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer), n_trials=args.n_trials)
+            best_hyperparams = study.best_trial.params
+
+        # Save Optuna's best params (same for both branches)
+        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
+            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+        )
         params["encoder"] = {
-            "lr": best_hyperparams["encoder_lr"],
-            "weight_decay": best_hyperparams["encoder_weight_decay"],
+            "lr": best_hyperparams.get("encoder_lr", args.encoder_lr),
+            "weight_decay": best_hyperparams.get("encoder_weight_decay", args.encoder_weight_decay),
         }
+        params["head"] = dict(head_params)
+        if "head_lr" in best_hyperparams:
+            params["head"]["lr"] = best_hyperparams["head_lr"]
+        if "head_weight_decay" in best_hyperparams:
+            params["head"]["weight_decay"] = best_hyperparams["head_weight_decay"]
+        if "batch_size" in optuna_params_resolved and "batch_size" in best_hyperparams:
+            params["batch_size"] = best_hyperparams["batch_size"]
         if args.use_lora:
-            params["lora_r"] = best_hyperparams["lora_r"]
-            params["lora_alpha"] = best_hyperparams["lora_alpha"]
-            params["lora_dropout"] = best_hyperparams["lora_dropout"]
+            params["lora_r"] = best_hyperparams.get("lora_r", args.lora_r)
+            params["lora_alpha"] = best_hyperparams.get("lora_alpha", args.lora_alpha)
+            params["lora_dropout"] = best_hyperparams.get("lora_dropout", args.lora_dropout)
         
         optuna_output_file = os.path.join(args.output_dir, "optuna_best_encoder_params.json")
         os.makedirs(args.output_dir, exist_ok=True)

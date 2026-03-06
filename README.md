@@ -99,6 +99,83 @@ To use your own CSV files instead, set both `--train_data_path` and `--val_data_
 - `--head_weight_decay`: Weight decay for the regression head (default: `0.001`)
 - `--head_dropout_rate`: Dropout rate for the regression head (default: `0.2`)
 
+#### Hyperparameter Optimization (Optuna)
+
+- `--optimize`: Enable Optuna-based hyperparameter search. After optimization, the script runs final training with the best parameters.
+- `--n_trials`: Number of Optuna trials (default: `100`). Used only when `--optimize` is set.
+- `--n_gpus`: Number of GPUs to use for **parallel Optuna trials** (default: `1`). When `--optimize` is set and `--n_gpus` is greater than 1, trials are distributed across GPUs (one subprocess per GPU with shared SQLite storage). Each trial still runs on a single GPU; this only parallelizes trials to reduce wall-clock time.
+- `--optuna_params`: Which parameters to optimize (space-separated, multi-select). Choices:
+  - `encoder_lr`, `encoder_weight_decay`
+  - `head_lr`, `head_weight_decay`
+  - `batch_size`
+  - `lora_r`, `lora_alpha`, `lora_dropout` (require `--use_lora`)
+
+If `--optuna_params` is omitted, the default is:
+- `encoder_lr encoder_weight_decay`, plus `lora_r lora_alpha lora_dropout` when `--use_lora` is set.
+
+**Optuna search space** (all optional; used only when `--optimize` is set):
+
+- `--optuna_encoder_lr_min` / `--optuna_encoder_lr_max`: Encoder learning rate range (defaults: `1e-5`, `1e-3`).
+- `--optuna_encoder_weight_decay_min` / `--optuna_encoder_weight_decay_max`: Encoder weight decay range (defaults: `1e-4`, `1e-1`).
+- `--optuna_head_lr_min` / `--optuna_head_lr_max`: Head learning rate range (defaults: `1e-4`, `1e-2`). Used only when `head_lr` is included in `--optuna_params`.
+- `--optuna_head_weight_decay_min` / `--optuna_head_weight_decay_max`: Head weight decay range (defaults: `0.0`, `0.1`). Used only when `head_weight_decay` is included in `--optuna_params`.
+- `--optuna_batch_size`: Comma-separated batch size candidates (default: `8,16,32`). Used only when `batch_size` is included in `--optuna_params`.
+- `--optuna_lora_r`: Comma-separated LoRA rank candidates (default: `4,8,16,32`). Used only with `--use_lora`.
+- `--optuna_lora_alpha`: Comma-separated LoRA alpha candidates (default: `16,32,64,128`). Used only with `--use_lora`.
+- `--optuna_lora_dropout_min` / `--optuna_lora_dropout_max`: LoRA dropout range (defaults: `0.0`, `0.5`). Used only with `--use_lora`.
+
+**Note**: Any parameter not included in `--optuna_params` stays fixed at the corresponding CLI value (e.g. `--head_lr`, `--batch_size`, etc.).
+
+**Single-GPU optimization** (one trial at a time):
+
+```bash
+python plm_supervised_fine_tuning.py \
+    --model_path facebook/esm2_t6_8M_UR50D \
+    --tokenizer_path facebook/esm2_t6_8M_UR50D \
+    --output_dir ./models/esm2_8m_optuna \
+    --optimize \
+    --n_trials 50
+```
+
+**Multi-GPU optimization** (e.g. 4 GPUs; trials run in parallel):
+
+```bash
+python plm_supervised_fine_tuning.py \
+    --model_path facebook/esm2_t6_8M_UR50D \
+    --tokenizer_path facebook/esm2_t6_8M_UR50D \
+    --output_dir ./models/esm2_8m_optuna \
+    --optimize \
+    --n_trials 100 \
+    --n_gpus 4
+```
+
+When using `--n_gpus > 1`, the script creates a shared SQLite database under `output_dir` (e.g. `optuna_study.db`) and launches one Python subprocess per GPU with `CUDA_VISIBLE_DEVICES` set so each process uses a single GPU. Best hyperparameters are written to `optuna_best_encoder_params.json` in `output_dir` after optimization.
+
+**Selecting which parameters to optimize** (example: optimize encoder + head + batch size):
+
+```bash
+python plm_supervised_fine_tuning.py \
+    --model_path facebook/esm2_t6_8M_UR50D \
+    --tokenizer_path facebook/esm2_t6_8M_UR50D \
+    --output_dir ./models/esm2_8m_optuna \
+    --optimize \
+    --n_trials 100 \
+    --n_gpus 4 \
+    --optuna_params encoder_lr encoder_weight_decay head_lr head_weight_decay batch_size \
+    --optuna_head_lr_min 1e-5 --optuna_head_lr_max 1e-2 \
+    --optuna_head_weight_decay_min 0.0 --optuna_head_weight_decay_max 0.05 \
+    --optuna_batch_size "8,16,32"
+```
+
+**Note**: To speed up each individual trial with multiple GPUs (e.g. DDP), run the script with `torchrun --nproc_per_node=N`; the Hugging Face Trainer will use all visible GPUs per trial. The `--n_gpus` option, in contrast, runs multiple trials in parallel (one GPU per trial).
+
+#### LoRA (parameter-efficient fine-tuning)
+
+- `--use_lora`: Enable LoRA fine-tuning (train only low-rank adapter layers).
+- `--lora_r`: LoRA rank (default: `16`).
+- `--lora_alpha`: LoRA alpha (default: `32`).
+- `--lora_dropout`: LoRA dropout (default: `0.2`). When `--optimize` is set, these can be tuned by Optuna.
+
 #### Example Commands
 
 **Default: fine-tuning with Hugging Face dataset (ZYMScott/thermo-seq):**
