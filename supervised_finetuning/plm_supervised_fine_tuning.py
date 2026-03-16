@@ -21,6 +21,8 @@ Overview:
     -   **LoRA (Low-Rank Adaptation)**: By using the `--use_lora` flag, switches to
         parameter-efficient fine-tuning via the PEFT library. In this mode, the
         base model's weights are frozen, and only small adapter layers are trained.
+    -   **Head-only**: By using the `--head_only` flag, freezes the encoder and trains
+        only the regression head (no PLM fine-tuning).
 4.  **Hyperparameter Optimization (Optional)**:
     -   If the `--optimize` flag is specified, it uses Optuna to search for the
         optimal hyperparameters for the encoder (lr, weight_decay) and LoRA (r, alpha, dropout).
@@ -30,6 +32,8 @@ Overview:
     -   Trains the final model using the determined hyperparameters.
     -   Evaluates performance on the evaluation dataset after each epoch and saves
         the best-performing model.
+    -   Labels (e.g. Tm) are scaled with MaxAbsScaler before training; at evaluation
+        and inference, predictions are inverse-transformed to the original scale.
 6.  **Model Saving**:
     -   Saves the trained model components (transformer backbone/LoRA adapters,
         regression head), the tokenizer, and the hyperparameters used to a specified
@@ -79,6 +83,9 @@ Command-line Arguments:
         Random seed for reproducibility. Default: 42
     --use_lora (bool):
         If set, enables parameter-efficient fine-tuning using LoRA. Default: False
+    --head_only (bool):
+        If set, freezes the encoder and trains only the regression head (no PLM fine-tuning).
+        Cannot be used together with --use_lora. Default: False
     --lora_r (int):
         The rank (r) of the LoRA update matrices. Default: 16
     --lora_alpha (int):
@@ -122,6 +129,8 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 from datasets import Dataset, load_dataset
 import optuna
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import MaxAbsScaler
+import joblib
 from safetensors.torch import save_file
 
 # (LORA_CONFIG, RegressionModel, CustomTrainerなどのクラス定義は変更なし)
@@ -258,11 +267,16 @@ class CustomTrainer(Trainer):
 
 # --- Metrics --------------------------------------------------------------------
 
-def compute_metrics(pred):
-    labels = pred.label_ids.reshape(-1)
-    preds  = pred.predictions.reshape(-1)
-    mse = mean_squared_error(labels, preds)
-    return {"mse":mse, "rmse":np.sqrt(mse), "mae":mean_absolute_error(labels,preds), "r2":r2_score(labels,preds)}
+def make_compute_metrics(scaler):
+    """Return a compute_metrics function that inverse-transforms predictions and labels to original scale."""
+    def compute_metrics(pred):
+        labels = pred.label_ids.reshape(-1)
+        preds = pred.predictions.reshape(-1)
+        labels_orig = scaler.inverse_transform(np.asarray(labels).reshape(-1, 1)).ravel()
+        preds_orig = scaler.inverse_transform(np.asarray(preds).reshape(-1, 1)).ravel()
+        mse = mean_squared_error(labels_orig, preds_orig)
+        return {"mse": mse, "rmse": np.sqrt(mse), "mae": mean_absolute_error(labels_orig, preds_orig), "r2": r2_score(labels_orig, preds_orig)}
+    return compute_metrics
 
 
 def clean_dataframe(df: pd.DataFrame, label_column: str = "tm", text_column: str = "sequence_aho_ungapped") -> pd.DataFrame:
@@ -293,10 +307,13 @@ def build_model(base_model, head_params, args):
 
 # --- Optuna objective -----------------------------------------------------------
 
-def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
+def objective(trial, args, train_ds, eval_ds, head_params, tokenizer, scaler):
     optuna_params = getattr(args, "optuna_params", None)
     if optuna_params is None:
-        optuna_params = ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+        if args.head_only:
+            optuna_params = ["head_lr", "head_weight_decay", "batch_size"]
+        else:
+            optuna_params = ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
 
     encoder_lr_min = getattr(args, "optuna_encoder_lr_min", 1e-5)
     encoder_lr_max = getattr(args, "optuna_encoder_lr_max", 1e-3)
@@ -336,7 +353,11 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
     base_model = AutoModel.from_pretrained(args.model_path)
     trial_args = deepcopy(args)
 
-    if args.use_lora:
+    if args.head_only:
+        for p in base_model.parameters():
+            p.requires_grad = False
+
+    if not args.head_only and args.use_lora:
         if get_peft_model is None:
             raise ImportError("peft is not installed but --use_lora was passed.")
         
@@ -396,7 +417,7 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        compute_metrics=compute_metrics,
+        compute_metrics=make_compute_metrics(scaler),
         tokenizer=tokenizer,
         head_params=trial_head_params,
         encoder_params=encoder_params,
@@ -423,7 +444,7 @@ def objective(trial, args, train_ds, eval_ds, head_params, tokenizer):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return result.get("eval_loss", float("inf"))
+    return result.get("eval_rmse", float("inf"))
 
 
 # --- Worker for multi-GPU Optuna (subprocess sets CUDA before torch import) ---
@@ -434,19 +455,53 @@ OPTUNA_PARAM_NAMES = ("encoder_lr", "encoder_weight_decay", "head_lr", "head_wei
 
 
 # run_optimization_worker is only used for the doc/flow; actual multi-GPU uses subprocess.
-def run_optimization_worker(gpu_id, storage_url, n_trials_this_worker, args, train_ds, eval_ds, head_params, tokenizer):
+def run_optimization_worker(gpu_id, storage_url, n_trials_this_worker, args, train_ds, eval_ds, head_params, tokenizer, scaler):
     """Run Optuna optimization in a worker process bound to a single GPU (used when invoked as subprocess)."""
     study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=storage_url)
     study.optimize(
-        lambda t: objective(t, args, train_ds, eval_ds, head_params, tokenizer),
+        lambda t: objective(t, args, train_ds, eval_ds, head_params, tokenizer, scaler),
         n_trials=n_trials_this_worker,
     )
 
 
 # --- Final training & saving ----------------------------------------------------
 
-def train_final(params, args, train_ds, eval_ds, tokenizer):
+N_REEVAL_CONFIGS = 5
+N_REEVAL_SEEDS = 3
+
+
+def get_params_from_trial(trial, args, head_params_base, optuna_params_resolved):
+    """Build the full params dict used by train_final from an Optuna trial's params."""
+    hp = trial.params
+    if args.head_only:
+        params = {
+            "encoder": {"lr": args.encoder_lr, "weight_decay": args.encoder_weight_decay},
+            "head": dict(head_params_base),
+        }
+    else:
+        params = {
+            "encoder": {
+                "lr": hp.get("encoder_lr", args.encoder_lr),
+                "weight_decay": hp.get("encoder_weight_decay", args.encoder_weight_decay),
+            },
+            "head": dict(head_params_base),
+        }
+    if "head_lr" in hp:
+        params["head"]["lr"] = hp["head_lr"]
+    if "head_weight_decay" in hp:
+        params["head"]["weight_decay"] = hp["head_weight_decay"]
+    if "batch_size" in optuna_params_resolved and "batch_size" in hp:
+        params["batch_size"] = hp["batch_size"]
+    if not args.head_only and args.use_lora:
+        params["lora_r"] = hp.get("lora_r", args.lora_r)
+        params["lora_alpha"] = hp.get("lora_alpha", args.lora_alpha)
+        params["lora_dropout"] = hp.get("lora_dropout", args.lora_dropout)
+    return params
+
+
+def train_final(params, args, train_ds, eval_ds, tokenizer, scaler, output_dir_override=None):
     print("--- Starting final model training ---")
+    save_dir = output_dir_override if output_dir_override is not None else args.output_dir
     encoder_params = params.get("encoder", {})
     head_params = params.get("head", {})
     batch_size = params.get("batch_size", args.batch_size)
@@ -456,6 +511,10 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
 
     base_model = AutoModel.from_pretrained(args.model_path)
     final_args = deepcopy(args)
+
+    if args.head_only:
+        for p in base_model.parameters():
+            p.requires_grad = False
 
     if args.use_lora:
         # If LoRA params were optimized or loaded, use them
@@ -469,7 +528,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
 
     model = build_model(base_model, head_params, final_args).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+    ckpt_dir = os.path.join(save_dir, "checkpoints")
     training_args = TrainingArguments(
         output_dir=ckpt_dir,
         num_train_epochs=args.num_train_epochs,
@@ -481,7 +540,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
         learning_rate=params.get("encoder_lr", args.encoder_lr),
         weight_decay=params.get("encoder_weight_decay", args.encoder_weight_decay),
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        metric_for_best_model="eval_rmse",
         greater_is_better=False,
         fp16=torch.cuda.is_available(),
         save_total_limit=None,  # Keep all checkpoints during training
@@ -497,7 +556,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        compute_metrics=compute_metrics,
+        compute_metrics=make_compute_metrics(scaler),
         tokenizer=tokenizer,
         head_params=head_params,
         encoder_params=encoder_params,
@@ -505,16 +564,22 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
 
     # Train the model
     train_result = trainer.train()
+    eval_metrics = trainer.evaluate()
     
     # Use the final model (last epoch)
     trained_model = trainer.model
     print(f"Training completed: {args.num_train_epochs} epochs")
 
     # ---------------- Saving ----------------------------------------------------
-    encoder_dir = os.path.join(args.output_dir, "encoder")
-    head_dir = os.path.join(args.output_dir, "head")
+    encoder_dir = os.path.join(save_dir, "encoder")
+    head_dir = os.path.join(save_dir, "head")
     os.makedirs(encoder_dir, exist_ok=True)
     os.makedirs(head_dir, exist_ok=True)
+
+    # Save label scaler for inference (inverse_transform)
+    scaler_path = os.path.join(save_dir, "label_scaler.joblib")
+    joblib.dump(scaler, scaler_path)
+    print(f"Saving label scaler to {scaler_path} …")
 
     # Save backbone (and LoRA adapter if present)
     if args.use_lora and isinstance(trained_model.encoder, PeftModel):
@@ -571,24 +636,26 @@ def train_final(params, args, train_ds, eval_ds, tokenizer):
         "batch_size": params.get("batch_size", args.batch_size)
     }
     params["training_info"] = training_info
+    params["label_scaler_scale"] = scaler.scale_.tolist()
     
-    with open(os.path.join(args.output_dir, "hyperparameters.json"), "w") as f:
+    with open(os.path.join(save_dir, "hyperparameters.json"), "w") as f:
         json.dump(params, f, indent=2)
 
     # Final verification of the output directory structure
     print(f"\n--- Final Output Directory Structure ---")
-    print(f"Output directory: {args.output_dir}")
+    print(f"Output directory: {save_dir}")
     
-    if os.path.exists(args.output_dir):
-        for root, dirs, files in os.walk(args.output_dir):
-            level = root.replace(args.output_dir, '').count(os.sep)
+    if os.path.exists(save_dir):
+        for root, dirs, files in os.walk(save_dir):
+            level = root.replace(save_dir, '').count(os.sep)
             indent = ' ' * 2 * level
             print(f"{indent}{os.path.basename(root)}/")
             subindent = ' ' * 2 * (level + 1)
             for file in files:
                 print(f"{subindent}{file}")
     
-    print(f"\nModel saved to {args.output_dir} (LoRA: {args.use_lora})")
+    print(f"\nModel saved to {save_dir} (Head-only: {args.head_only}, LoRA: {args.use_lora})")
+    return eval_metrics.get("eval_rmse", float("inf"))
 
 
 # --- Main ----------------------------------------------------------------------
@@ -653,10 +720,15 @@ def main():
     parser.add_argument("--head_activate_fnc", type=str, default="ReLU", help="Activation function for the regression head")
 
     # -------- Encoder hyperparameters -------------------------------------------
+    parser.add_argument("--head_only", action="store_true",
+        help="Only train the regression head; freeze the encoder (no PLM fine-tuning).")
     parser.add_argument("--encoder_lr", type=float, default=1e-4, help="Learning rate for the encoder")
     parser.add_argument("--encoder_weight_decay", type=float, default=0.01, help="Weight decay for the encoder")
 
     args = parser.parse_args()
+
+    if args.head_only and args.use_lora:
+        raise ValueError("--head_only and --use_lora cannot be used together.")
 
     # Require both or neither of train_data_path and val_data_path
     if args.train_data_path is not None and args.val_data_path is None:
@@ -669,9 +741,15 @@ def main():
             raise ValueError("optuna_encoder_lr_min must be <= optuna_encoder_lr_max")
         if args.optuna_encoder_weight_decay_min > args.optuna_encoder_weight_decay_max:
             raise ValueError("optuna_encoder_weight_decay_min must be <= optuna_encoder_weight_decay_max")
-        optuna_params = args.optuna_params if args.optuna_params is not None else (
-            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
-        )
+        if args.head_only:
+            optuna_params = args.optuna_params if args.optuna_params is not None else ["head_lr", "head_weight_decay", "batch_size"]
+            for p in optuna_params:
+                if p not in ("head_lr", "head_weight_decay", "batch_size"):
+                    raise ValueError(f"--head_only only allows optimizing head_lr, head_weight_decay, batch_size; got {p}")
+        else:
+            optuna_params = args.optuna_params if args.optuna_params is not None else (
+                ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+            )
         for p in optuna_params:
             if p not in OPTUNA_PARAM_NAMES:
                 raise ValueError(f"Invalid --optuna_params value: {p}. Choices: {list(OPTUNA_PARAM_NAMES)}")
@@ -725,6 +803,16 @@ def main():
         # Drop rows with null labels or text if any
         train_ds_raw = train_ds_raw.filter(lambda x: x["text"] is not None and x["labels"] is not None and str(x["text"]).strip() != "")
         val_ds_raw = val_ds_raw.filter(lambda x: x["text"] is not None and x["labels"] is not None and str(x["text"]).strip() != "")
+        # Scale labels with MaxAbsScaler (fit on train only)
+        train_labels = np.array(train_ds_raw["labels"]).reshape(-1, 1)
+        scaler = MaxAbsScaler().fit(train_labels)
+        train_ds_raw = train_ds_raw.remove_columns("labels").add_column(
+            "labels", scaler.transform(train_labels).ravel().tolist()
+        )
+        val_labels = np.array(val_ds_raw["labels"]).reshape(-1, 1)
+        val_ds_raw = val_ds_raw.remove_columns("labels").add_column(
+            "labels", scaler.transform(val_labels).ravel().tolist()
+        )
         train_ds = train_ds_raw.map(tokenize_fn, batched=True)
         val_ds = val_ds_raw.map(tokenize_fn, batched=True)
         print(f"Loaded Hugging Face dataset '{args.dataset_name}' – train: {len(train_ds)} | val: {len(val_ds)}")
@@ -732,6 +820,11 @@ def main():
         # Load from CSV with user-specified column names
         df_train = clean_dataframe(pd.read_csv(args.train_data_path), label_column=args.label_column, text_column=args.text_column)
         df_val = clean_dataframe(pd.read_csv(args.val_data_path), label_column=args.label_column, text_column=args.text_column)
+        # Scale labels with MaxAbsScaler (fit on train only)
+        train_labels = df_train["labels"].values.reshape(-1, 1)
+        scaler = MaxAbsScaler().fit(train_labels)
+        df_train["labels"] = scaler.transform(train_labels).ravel()
+        df_val["labels"] = scaler.transform(df_val["labels"].values.reshape(-1, 1)).ravel()
         train_ds = Dataset.from_pandas(df_train).map(tokenize_fn, batched=True)
         val_ds = Dataset.from_pandas(df_val).map(tokenize_fn, batched=True)
         print(f"Dataset sizes – train: {len(train_ds)} | val: {len(val_ds)}")
@@ -756,14 +849,17 @@ def main():
         print("--- Optuna worker mode: running trials then exiting ---")
         study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=args.optuna_storage)
         study.optimize(
-            lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer),
+            lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer, scaler),
             n_trials=args.optuna_n_trials_this_worker,
         )
         sys.exit(0)
 
     # 2. Encoder parameters from command-line or Optuna
     if args.optimize:
-        print("--- Optimizing encoder (and LoRA) hyperparameters with Optuna ---")
+        if args.head_only:
+            print("--- Optimizing head hyperparameters with Optuna ---")
+        else:
+            print("--- Optimizing encoder (and LoRA) hyperparameters with Optuna ---")
         n_gpus = min(args.n_gpus, torch.cuda.device_count()) if torch.cuda.is_available() else 1
         if n_gpus <= 0:
             n_gpus = 1
@@ -805,34 +901,71 @@ def main():
             # Single-GPU: current in-process optimization
             sampler = optuna.samplers.TPESampler(seed=args.seed)
             study = optuna.create_study(direction="minimize", sampler=sampler, pruner=optuna.pruners.MedianPruner())
-            study.optimize(lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer), n_trials=args.n_trials)
+            study.optimize(lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer, scaler), n_trials=args.n_trials)
             best_hyperparams = study.best_trial.params
 
-        # Save Optuna's best params (same for both branches)
-        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
-            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
-        )
-        params["encoder"] = {
-            "lr": best_hyperparams.get("encoder_lr", args.encoder_lr),
-            "weight_decay": best_hyperparams.get("encoder_weight_decay", args.encoder_weight_decay),
-        }
-        params["head"] = dict(head_params)
-        if "head_lr" in best_hyperparams:
-            params["head"]["lr"] = best_hyperparams["head_lr"]
-        if "head_weight_decay" in best_hyperparams:
-            params["head"]["weight_decay"] = best_hyperparams["head_weight_decay"]
-        if "batch_size" in optuna_params_resolved and "batch_size" in best_hyperparams:
-            params["batch_size"] = best_hyperparams["batch_size"]
-        if args.use_lora:
-            params["lora_r"] = best_hyperparams.get("lora_r", args.lora_r)
-            params["lora_alpha"] = best_hyperparams.get("lora_alpha", args.lora_alpha)
-            params["lora_dropout"] = best_hyperparams.get("lora_dropout", args.lora_dropout)
-        
-        optuna_output_file = os.path.join(args.output_dir, "optuna_best_encoder_params.json")
+        # Re-evaluate top 5 trials with 3 seeds each, then save best run
+        if args.head_only:
+            optuna_params_resolved = args.optuna_params if args.optuna_params is not None else ["head_lr", "head_weight_decay", "batch_size"]
+        else:
+            optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
+                ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+            )
+
+        completed = [t for t in study.get_trials() if t.value is not None]
+        if not completed:
+            raise ValueError("No completed Optuna trials to re-evaluate.")
+        sorted_trials = sorted(completed, key=lambda t: t.value)
+        top5_trials = sorted_trials[:N_REEVAL_CONFIGS]
+        seeds = [args.seed + k for k in range(N_REEVAL_SEEDS)]
+
+        results = {}
+        for i, trial in enumerate(top5_trials):
+            params_i = get_params_from_trial(trial, args, head_params, optuna_params_resolved)
+            results[i] = {}
+            for seed in seeds:
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                save_subdir = os.path.join(args.output_dir, "reeval", f"c{i}_s{seed}")
+                os.makedirs(save_subdir, exist_ok=True)
+                rmse = train_final(params_i, args, train_ds, val_ds, tokenizer, scaler, output_dir_override=save_subdir)
+                results[i][seed] = (rmse, save_subdir)
+
+        mean_rmse = [np.mean([results[i][s][0] for s in seeds]) for i in range(len(top5_trials))]
+        best_config_idx = int(np.argmin(mean_rmse))
+        best_seed = min(seeds, key=lambda s: results[best_config_idx][s][0])
+        best_subdir = results[best_config_idx][best_seed][1]
+
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(optuna_output_file, 'w') as f:
-            json.dump(best_hyperparams, f, indent=4)
-        print(f"Saved best Optuna params to {optuna_output_file}")
+        for sub in ("encoder", "head", "checkpoints"):
+            dst = os.path.join(args.output_dir, sub)
+            src = os.path.join(best_subdir, sub)
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            if os.path.exists(src):
+                shutil.copytree(src, dst)
+        for fname in ("label_scaler.joblib", "hyperparameters.json"):
+            shutil.copy2(os.path.join(best_subdir, fname), os.path.join(args.output_dir, fname))
+
+        with open(os.path.join(args.output_dir, "optuna_best_encoder_params.json"), "w") as f:
+            json.dump(top5_trials[best_config_idx].params, f, indent=4)
+        best_trial_info = {
+            "config_index": best_config_idx,
+            "chosen_seed": best_seed,
+            "mean_rmse": float(mean_rmse[best_config_idx]),
+            "seed_scores": [results[best_config_idx][s][0] for s in seeds],
+            "all_config_mean_rmse": [float(m) for m in mean_rmse],
+        }
+        with open(os.path.join(args.output_dir, "best_trial_info.json"), "w") as f:
+            json.dump(best_trial_info, f, indent=2)
+
+        reeval_dir = os.path.join(args.output_dir, "reeval")
+        if os.path.exists(reeval_dir):
+            shutil.rmtree(reeval_dir)
+        print(f"Re-evaluation done. Best config index {best_config_idx}, seed {best_seed}, mean_rmse={mean_rmse[best_config_idx]:.4f}")
 
     else:
         # use command-line specified hyperparameters
@@ -844,8 +977,8 @@ def main():
         print("Head params:", json.dumps(params['head'], indent=2))
         print("Encoder params:", json.dumps(params['encoder'], indent=2))
 
-    # 3. Final training
-    train_final(params, args, train_ds, val_ds, tokenizer)
+        # 3. Final training
+        train_final(params, args, train_ds, val_ds, tokenizer, scaler)
     print("--- Done ---")
 
 

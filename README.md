@@ -91,17 +91,28 @@ To use your own CSV files instead, set both `--train_data_path` and `--val_data_
 - `--max_length`: Maximum sequence length for tokenization (default: `256`)
 - `--seed`: Random seed for reproducibility (default: `42`)
 
+#### Label scaling and inference
+
+Training labels (e.g. Tm) are scaled with **MaxAbsScaler** (fit on the training set only) before fine-tuning. At **evaluation** and **inference**, predictions must be inverse-transformed to the original scale. The script saves the fitted scaler as `output_dir/label_scaler.joblib`. When loading a trained model for prediction, load the scaler with `joblib.load(os.path.join(output_dir, "label_scaler.joblib"))` and apply `scaler.inverse_transform(predictions.reshape(-1, 1)).ravel()` to obtain Tm-scale predictions.
+
+#### Fine-tuning mode
+
+- **Full fine-tuning** (default): All parameters (encoder + head) are trained.
+- **Head-only** (`--head_only`): The encoder is frozen (no gradient updates) in both Optuna trials and in final training; only the regression head is trained. This ensures that the saved encoder matches the pre-trained base model when using head-only. Useful for quick experiments or when using the encoder as a fixed feature extractor. Cannot be used together with `--use_lora`.
+- **LoRA** (`--use_lora`): Parameter-efficient fine-tuning; see [LoRA (parameter-efficient fine-tuning)](#lora-parameter-efficient-fine-tuning) below.
+
 #### Learning Rate and Regularization
 
 - `--encoder_lr`: Learning rate for the encoder (default: `1e-4`)
 - `--encoder_weight_decay`: Weight decay for the encoder (default: `0.01`)
 - `--head_lr`: Learning rate for the regression head (default: `1e-3`)
-- `--head_weight_decay`: Weight decay for the regression head (default: `0.001`)
+- `--head_weight_decay`: Weight decay for the regression head (default: `0.001`). For `head_type ridge`, this acts as L2 regularization on the head.
 - `--head_dropout_rate`: Dropout rate for the regression head (default: `0.2`)
+- `--head_activate_fnc`: Activation function for the regression head, e.g. `ReLU` (default: `ReLU`). Used only when `head_type` is `mlp`.
 
 #### Hyperparameter Optimization (Optuna)
 
-- `--optimize`: Enable Optuna-based hyperparameter search. After optimization, the script runs final training with the best parameters.
+- `--optimize`: Enable Optuna-based hyperparameter search. After optimization, the script **re-evaluates the top 5 trials** (by validation RMSE) with **3 different random seeds** each (15 runs in total). The hyperparameter **config with the best mean validation RMSE** over the 3 seeds is selected; the **saved model** is the single run (among those 3 seeds for that config) that achieved the best validation RMSE. This improves reproducibility and reduces reliance on a single lucky trial. Validation metrics reported each epoch are MSE, RMSE, MAE, and R² (all on the inverse-transformed label scale); **RMSE** is used for best-model selection.
 - `--n_trials`: Number of Optuna trials (default: `100`). Used only when `--optimize` is set.
 - `--n_gpus`: Number of GPUs to use for **parallel Optuna trials** (default: `1`). When `--optimize` is set and `--n_gpus` is greater than 1, trials are distributed across GPUs (one subprocess per GPU with shared SQLite storage). Each trial still runs on a single GPU; this only parallelizes trials to reduce wall-clock time.
 - `--optuna_params`: Which parameters to optimize (space-separated, multi-select). Choices:
@@ -112,6 +123,7 @@ To use your own CSV files instead, set both `--train_data_path` and `--val_data_
 
 If `--optuna_params` is omitted, the default is:
 - `encoder_lr encoder_weight_decay`, plus `lora_r lora_alpha lora_dropout` when `--use_lora` is set.
+- When `--head_only` is set, the default is `head_lr head_weight_decay batch_size` (only these three can be optimized in head-only mode).
 
 **Optuna search space** (all optional; used only when `--optimize` is set):
 
@@ -149,7 +161,7 @@ python plm_supervised_fine_tuning.py \
     --n_gpus 4
 ```
 
-When using `--n_gpus > 1`, the script creates a shared SQLite database under `output_dir` (e.g. `optuna_study.db`) and launches one Python subprocess per GPU with `CUDA_VISIBLE_DEVICES` set so each process uses a single GPU. Best hyperparameters are written to `optuna_best_encoder_params.json` in `output_dir` after optimization.
+When using `--n_gpus > 1`, the script creates a shared SQLite database under `output_dir` (e.g. `optuna_study.db`) and launches one Python subprocess per GPU with `CUDA_VISIBLE_DEVICES` set so each process uses a single GPU. After optimization, the top 5 trials are re-run with 3 seeds each; the best config (by mean validation RMSE) and the best seed for that config are written to `optuna_best_encoder_params.json` and `best_trial_info.json` in `output_dir`. The saved model (encoder, head, scaler, etc.) is the run that achieved the best validation RMSE for the chosen config.
 
 **Selecting which parameters to optimize** (example: optimize encoder + head + batch size):
 
@@ -171,14 +183,31 @@ python plm_supervised_fine_tuning.py \
 
 #### LoRA (parameter-efficient fine-tuning)
 
-- `--use_lora`: Enable LoRA fine-tuning (train only low-rank adapter layers).
+- `--use_lora`: Enable LoRA fine-tuning (train only low-rank adapter layers). Cannot be used with `--head_only`.
 - `--lora_r`: LoRA rank (default: `16`).
 - `--lora_alpha`: LoRA alpha (default: `32`).
 - `--lora_dropout`: LoRA dropout (default: `0.2`). When `--optimize` is set, these can be tuned by Optuna.
 
 #### Example Commands
 
-**Default: fine-tuning with Hugging Face dataset (ZYMScott/thermo-seq):**
+**Head-only** (freeze encoder, train only the regression head):
+
+```bash
+conda activate esm
+cd supervised_finetuning
+
+python plm_supervised_fine_tuning.py \
+    --model_path facebook/esm2_t6_8M_UR50D \
+    --tokenizer_path facebook/esm2_t6_8M_UR50D \
+    --output_dir ./models/esm2_8m_head_only \
+    --head_only \
+    --embedding_type mean \
+    --head_type ridge \
+    --num_train_epochs 50 \
+    --batch_size 16
+```
+
+**Default: full fine-tuning** with Hugging Face dataset (ZYMScott/thermo-seq):
 
 ```bash
 conda activate esm
@@ -207,8 +236,6 @@ python plm_supervised_fine_tuning.py \
     --output_dir ./models/esm2_8m_base-sft/encoder_lr_5e-5_batch_size_16_encoder_weight_decay_0.0001 \
     --embedding_type mean \
     --head_type ridge \
-    --head_lr 0.1 \
-    --head_weight_decay 0.01 \
     --head_lr 5e-05 \
     --head_weight_decay 0.0001 \
     --num_train_epochs 50 \
@@ -401,7 +428,12 @@ Refer to the `sparse_autoencoder/README.md` for more detailed information about 
 2. **Working Directory**: Make sure you are in the correct directory when running scripts, or adjust paths accordingly.
 
 3. **Data Format**: Training/validation CSV files must contain:
-   - `sequence_aho_ungapped`: Protein sequence strings
-   - `tm`: Numeric thermostability values (target variable)
+   - A sequence column (default name: `sequence_aho_ungapped`; override with `--text_column`)
+   - A numeric target column (default name: `tm`; override with `--label_column`)
 
-4. **Output Structure**: Fine-tuned models are saved with separate directories for the encoder and regression head.
+4. **Output Structure**: Fine-tuned models are saved under `output_dir` with:
+   - `encoder/`: Transformer backbone (or LoRA adapter + config when `--use_lora`), plus tokenizer files
+   - `head/head_weights.safetensors`: Regression head weights (safetensors format)
+   - `label_scaler.joblib`: Fitted MaxAbsScaler for inverse-transforming predictions to the original label scale
+   - `hyperparameters.json`: Encoder/head hyperparameters, training info, and scaler scale
+   - When `--optimize` is used: `optuna_best_encoder_params.json` (best trial params), `best_trial_info.json` (config index, chosen seed, mean RMSE, etc.)
