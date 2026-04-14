@@ -499,7 +499,204 @@ def get_params_from_trial(trial, args, head_params_base, optuna_params_resolved)
     return params
 
 
-def train_final(params, args, train_ds, eval_ds, tokenizer, scaler, output_dir_override=None):
+def _ensure_single_process_env():
+    """Set env vars so TrainingArguments/Accelerate treat this process as single-process (no distributed)."""
+    os.environ["WORLD_SIZE"] = "1"
+    for key in ("RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
+        os.environ.pop(key, None)
+
+
+def run_reeval_worker(args, train_ds, val_ds, head_params, tokenizer, scaler):
+    """Run a subset of reeval (config, seed) tasks and write results to a JSON file.
+    Used when this process is launched as a subprocess with --reeval_worker.
+    """
+    _ensure_single_process_env()
+    study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=args.reeval_storage)
+    with open(args.reeval_tasks_file, "r") as f:
+        tasks = json.load(f)  # list of {"config_i": int, "seed": int}
+
+    if args.head_only:
+        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else ["head_lr", "head_weight_decay", "batch_size"]
+    else:
+        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
+            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+        )
+    completed = [t for t in study.get_trials() if t.value is not None]
+    sorted_trials = sorted(completed, key=lambda t: t.value)
+    top_trials = sorted_trials[:N_REEVAL_CONFIGS]
+
+    results = []  # list of {"config_i": i, "seed": s, "rmse": float, "save_subdir": str}
+    for task in tasks:
+        config_i = task["config_i"]
+        seed = task["seed"]
+        trial = top_trials[config_i]
+        params_i = get_params_from_trial(trial, args, head_params, optuna_params_resolved)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        save_subdir = os.path.join(args.output_dir, "reeval", f"c{config_i}_s{seed}")
+        os.makedirs(save_subdir, exist_ok=True)
+        rmse = train_final(
+            params_i, args, train_ds, val_ds, tokenizer, scaler,
+            output_dir_override=save_subdir,
+            save_total_limit_override=1,
+        )
+        results.append({"config_i": config_i, "seed": seed, "rmse": float(rmse), "save_subdir": save_subdir})
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    reeval_dir = os.path.join(args.output_dir, "reeval")
+    os.makedirs(reeval_dir, exist_ok=True)
+    out_path = os.path.join(reeval_dir, f"worker_{args.reeval_worker_id}_results.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+def run_reeval_from_study(study, args, train_ds, val_ds, head_params, tokenizer, scaler, n_gpus_reeval=1, storage_url=None):
+    """Re-evaluate top trials with multiple seeds and save best run.
+
+    This does NOT execute new Optuna trials; it consumes an existing Study instance
+    (e.g., loaded from optuna_study.db) and performs the 'reeval' stage only.
+    When n_gpus_reeval > 1 and storage_url is set, runs (config, seed) tasks in parallel
+    across multiple GPU worker processes.
+    """
+    # Ensure this process (and any subprocess we spawn) does not trigger distributed/multinode
+    # when creating TrainingArguments (e.g. after multi-GPU Optuna left WORLD_SIZE set).
+    if n_gpus_reeval <= 1:
+        _ensure_single_process_env()
+    if args.head_only:
+        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else ["head_lr", "head_weight_decay", "batch_size"]
+    else:
+        optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
+            ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
+        )
+
+    completed = [t for t in study.get_trials() if t.value is not None]
+    if not completed:
+        raise ValueError("No completed Optuna trials to re-evaluate.")
+    sorted_trials = sorted(completed, key=lambda t: t.value)
+    top_trials = sorted_trials[:N_REEVAL_CONFIGS]
+    seeds = [args.seed + k for k in range(N_REEVAL_SEEDS)]
+
+    n_reeval_runs = len(top_trials) * len(seeds)
+    print(f"[Reeval] Re-training top {len(top_trials)} configs with {len(seeds)} seeds each ({n_reeval_runs} runs total). This can take a long time.")
+
+    results = {}
+    if n_gpus_reeval > 1 and storage_url is not None:
+        # Parallel reeval: split (config_i, seed) tasks across worker processes
+        tasks = [{"config_i": i, "seed": s} for i in range(len(top_trials)) for s in seeds]
+        n_workers = min(n_gpus_reeval, len(tasks))
+        if n_workers <= 0:
+            n_workers = 1
+        reeval_dir = os.path.join(args.output_dir, "reeval")
+        os.makedirs(reeval_dir, exist_ok=True)
+        # Chunk tasks for each worker
+        chunk_size = (len(tasks) + n_workers - 1) // n_workers
+        task_chunks = [tasks[k * chunk_size:(k + 1) * chunk_size] for k in range(n_workers)]
+        # Drop empty chunks (if tasks < n_workers)
+        task_chunks = [c for c in task_chunks if c]
+        n_workers = len(task_chunks)
+        print(f"[Reeval] Using {n_workers} GPU workers for parallel re-evaluation.")
+        task_files = []
+        for k in range(n_workers):
+            tf = os.path.join(reeval_dir, f"reeval_tasks_{k}.json")
+            with open(tf, "w") as f:
+                json.dump(task_chunks[k], f, indent=2)
+            task_files.append(tf)
+        procs = []
+        for k in range(n_workers):
+            # Workers must see single-process env so TrainingArguments does not require MASTER_ADDR
+            env = {k_: v for k_, v in os.environ.items() if k_ not in ("RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK", "WORLD_SIZE")}
+            env["CUDA_VISIBLE_DEVICES"] = str(k)
+            env["WORLD_SIZE"] = "1"
+            cmd = [sys.executable, "-u", __file__] + sys.argv[1:] + [
+                "--reeval_worker",
+                "--reeval_worker_id", str(k),
+                "--reeval_tasks_file", task_files[k],
+                "--reeval_storage", storage_url,
+            ]
+            p = subprocess.Popen(cmd, env=env)
+            procs.append(p)
+        for p in procs:
+            p.wait()
+            if p.returncode != 0:
+                raise RuntimeError(f"Reeval worker process exited with code {p.returncode}")
+        # Merge worker results into results[i][seed] = (rmse, save_subdir)
+        for i in range(len(top_trials)):
+            results[i] = {}
+        for k in range(n_workers):
+            res_path = os.path.join(reeval_dir, f"worker_{k}_results.json")
+            with open(res_path, "r") as f:
+                worker_results = json.load(f)
+            for r in worker_results:
+                config_i = r["config_i"]
+                seed = r["seed"]
+                results[config_i][seed] = (r["rmse"], r["save_subdir"])
+    else:
+        # Sequential reeval (single process)
+        run_idx = 0
+        for i, trial in enumerate(top_trials):
+            params_i = get_params_from_trial(trial, args, head_params, optuna_params_resolved)
+            results[i] = {}
+            for seed in seeds:
+                run_idx += 1
+                print(f"[Reeval] Run {run_idx}/{n_reeval_runs}: config {i+1}/{len(top_trials)}, seed {seed}")
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                save_subdir = os.path.join(args.output_dir, "reeval", f"c{i}_s{seed}")
+                os.makedirs(save_subdir, exist_ok=True)
+                rmse = train_final(
+                    params_i, args, train_ds, val_ds, tokenizer, scaler,
+                    output_dir_override=save_subdir,
+                    save_total_limit_override=1,
+                )
+                results[i][seed] = (rmse, save_subdir)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[Reeval] Run {run_idx}/{n_reeval_runs} done: RMSE={rmse:.4f}")
+
+    mean_rmse = [np.mean([results[i][s][0] for s in seeds]) for i in range(len(top_trials))]
+    best_config_idx = int(np.argmin(mean_rmse))
+    best_seed = min(seeds, key=lambda s: results[best_config_idx][s][0])
+    best_subdir = results[best_config_idx][best_seed][1]
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    for sub in ("encoder", "head", "checkpoints"):
+        dst = os.path.join(args.output_dir, sub)
+        src = os.path.join(best_subdir, sub)
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        if os.path.exists(src):
+            shutil.copytree(src, dst)
+    for fname in ("label_scaler.joblib", "hyperparameters.json"):
+        shutil.copy2(os.path.join(best_subdir, fname), os.path.join(args.output_dir, fname))
+
+    with open(os.path.join(args.output_dir, "optuna_best_encoder_params.json"), "w") as f:
+        json.dump(top_trials[best_config_idx].params, f, indent=4)
+    best_trial_info = {
+        "config_index": best_config_idx,
+        "chosen_seed": best_seed,
+        "mean_rmse": float(mean_rmse[best_config_idx]),
+        "seed_scores": [results[best_config_idx][s][0] for s in seeds],
+        "all_config_mean_rmse": [float(m) for m in mean_rmse],
+    }
+    with open(os.path.join(args.output_dir, "best_trial_info.json"), "w") as f:
+        json.dump(best_trial_info, f, indent=2)
+
+    reeval_dir = os.path.join(args.output_dir, "reeval")
+    if os.path.exists(reeval_dir):
+        shutil.rmtree(reeval_dir)
+    print(f"Re-evaluation done. Best config index {best_config_idx}, seed {best_seed}, mean_rmse={mean_rmse[best_config_idx]:.4f}")
+
+
+def train_final(params, args, train_ds, eval_ds, tokenizer, scaler, output_dir_override=None, save_total_limit_override=None):
     print("--- Starting final model training ---")
     save_dir = output_dir_override if output_dir_override is not None else args.output_dir
     encoder_params = params.get("encoder", {})
@@ -543,7 +740,7 @@ def train_final(params, args, train_ds, eval_ds, tokenizer, scaler, output_dir_o
         metric_for_best_model="eval_rmse",
         greater_is_better=False,
         fp16=torch.cuda.is_available(),
-        save_total_limit=None,  # Keep all checkpoints during training
+        save_total_limit=save_total_limit_override if save_total_limit_override is not None else None,
         warmup_steps=100,
         report_to="none",
         dataloader_drop_last=False,
@@ -683,8 +880,14 @@ def main():
     parser.add_argument("--num_train_epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--optimize", action="store_true", help="Enable Optuna optimization for encoder/LoRA.")
+    parser.add_argument("--reeval_only", action="store_true",
+        help="Skip Optuna optimization and run only the re-evaluation stage from an existing optuna_study.db.")
+    parser.add_argument("--optuna_study_path", type=str, default=None,
+        help="Path to optuna_study.db (SQLite). If omitted, uses <output_dir>/optuna_study.db when --reeval_only is set.")
     parser.add_argument("--n_trials", type=int, default=100)
     parser.add_argument("--n_gpus", type=int, default=1, help="Number of GPUs for parallel Optuna trials (only when --optimize). Default: 1")
+    parser.add_argument("--reeval_n_gpus", type=int, default=1,
+        help="Number of GPUs for parallel re-evaluation (top configs × seeds). Used with --optimize (after Optuna) or --reeval_only. Default: 1")
     # Optuna search space (used only when --optimize)
     parser.add_argument("--optuna_encoder_lr_min", type=float, default=1e-5, help="Optuna: encoder LR lower bound (default: 1e-5)")
     parser.add_argument("--optuna_encoder_lr_max", type=float, default=1e-3, help="Optuna: encoder LR upper bound (default: 1e-3)")
@@ -706,6 +909,11 @@ def main():
     # Internal: used when this script is run as an Optuna worker subprocess (do not set manually)
     parser.add_argument("--optuna_storage", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--optuna_n_trials_this_worker", type=int, default=None, help=argparse.SUPPRESS)
+    # Internal: used when this script is run as a reeval worker subprocess (do not set manually)
+    parser.add_argument("--reeval_worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reeval_worker_id", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--reeval_tasks_file", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--reeval_storage", type=str, default=None, help=argparse.SUPPRESS)
 
     # -------- LoRA options (default: disabled) ----------------------------------
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA fine‑tuning")
@@ -729,6 +937,8 @@ def main():
 
     if args.head_only and args.use_lora:
         raise ValueError("--head_only and --use_lora cannot be used together.")
+    if args.optimize and args.reeval_only:
+        raise ValueError("--optimize and --reeval_only cannot be used together.")
 
     # Require both or neither of train_data_path and val_data_path
     if args.train_data_path is not None and args.val_data_path is None:
@@ -854,6 +1064,32 @@ def main():
         )
         sys.exit(0)
 
+    # Worker mode: run a subset of reeval (config, seed) tasks then exit (used when launched as subprocess for multi-GPU reeval)
+    if getattr(args, "reeval_worker", False) and getattr(args, "reeval_tasks_file", None) is not None and getattr(args, "reeval_storage", None) is not None:
+        print("--- Reeval worker mode: running assigned tasks then exiting ---")
+        run_reeval_worker(args, train_ds, val_ds, head_params, tokenizer, scaler)
+        sys.exit(0)
+
+    # Re-evaluation only mode: load an existing Optuna study and run reeval without new trials
+    if args.reeval_only:
+        os.makedirs(args.output_dir, exist_ok=True)
+        study_path = args.optuna_study_path if args.optuna_study_path is not None else os.path.join(args.output_dir, "optuna_study.db")
+        study_path = os.path.abspath(study_path)
+        if not os.path.exists(study_path):
+            raise FileNotFoundError(
+                f"optuna_study.db not found at {study_path}. "
+                "Provide --optuna_study_path or ensure <output_dir>/optuna_study.db exists."
+            )
+        storage_url = f"sqlite:///{study_path}"
+        print(f"--- Re-eval only mode: loading Optuna study from {study_path} ---")
+        study = optuna.load_study(study_name=OPTUNA_STUDY_NAME, storage=storage_url)
+        n_gpus_reeval = min(args.reeval_n_gpus, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+        if n_gpus_reeval <= 0:
+            n_gpus_reeval = 1
+        run_reeval_from_study(study, args, train_ds, val_ds, head_params, tokenizer, scaler, n_gpus_reeval=n_gpus_reeval, storage_url=storage_url)
+        print("--- Done ---")
+        return
+
     # 2. Encoder parameters from command-line or Optuna
     if args.optimize:
         if args.head_only:
@@ -904,68 +1140,15 @@ def main():
             study.optimize(lambda t: objective(t, args, train_ds, val_ds, head_params, tokenizer, scaler), n_trials=args.n_trials)
             best_hyperparams = study.best_trial.params
 
-        # Re-evaluate top 5 trials with 3 seeds each, then save best run
-        if args.head_only:
-            optuna_params_resolved = args.optuna_params if args.optuna_params is not None else ["head_lr", "head_weight_decay", "batch_size"]
-        else:
-            optuna_params_resolved = args.optuna_params if args.optuna_params is not None else (
-                ["encoder_lr", "encoder_weight_decay"] + (["lora_r", "lora_alpha", "lora_dropout"] if args.use_lora else [])
-            )
-
-        completed = [t for t in study.get_trials() if t.value is not None]
-        if not completed:
-            raise ValueError("No completed Optuna trials to re-evaluate.")
-        sorted_trials = sorted(completed, key=lambda t: t.value)
-        top5_trials = sorted_trials[:N_REEVAL_CONFIGS]
-        seeds = [args.seed + k for k in range(N_REEVAL_SEEDS)]
-
-        results = {}
-        for i, trial in enumerate(top5_trials):
-            params_i = get_params_from_trial(trial, args, head_params, optuna_params_resolved)
-            results[i] = {}
-            for seed in seeds:
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-                save_subdir = os.path.join(args.output_dir, "reeval", f"c{i}_s{seed}")
-                os.makedirs(save_subdir, exist_ok=True)
-                rmse = train_final(params_i, args, train_ds, val_ds, tokenizer, scaler, output_dir_override=save_subdir)
-                results[i][seed] = (rmse, save_subdir)
-
-        mean_rmse = [np.mean([results[i][s][0] for s in seeds]) for i in range(len(top5_trials))]
-        best_config_idx = int(np.argmin(mean_rmse))
-        best_seed = min(seeds, key=lambda s: results[best_config_idx][s][0])
-        best_subdir = results[best_config_idx][best_seed][1]
-
-        os.makedirs(args.output_dir, exist_ok=True)
-        for sub in ("encoder", "head", "checkpoints"):
-            dst = os.path.join(args.output_dir, sub)
-            src = os.path.join(best_subdir, sub)
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            if os.path.exists(src):
-                shutil.copytree(src, dst)
-        for fname in ("label_scaler.joblib", "hyperparameters.json"):
-            shutil.copy2(os.path.join(best_subdir, fname), os.path.join(args.output_dir, fname))
-
-        with open(os.path.join(args.output_dir, "optuna_best_encoder_params.json"), "w") as f:
-            json.dump(top5_trials[best_config_idx].params, f, indent=4)
-        best_trial_info = {
-            "config_index": best_config_idx,
-            "chosen_seed": best_seed,
-            "mean_rmse": float(mean_rmse[best_config_idx]),
-            "seed_scores": [results[best_config_idx][s][0] for s in seeds],
-            "all_config_mean_rmse": [float(m) for m in mean_rmse],
-        }
-        with open(os.path.join(args.output_dir, "best_trial_info.json"), "w") as f:
-            json.dump(best_trial_info, f, indent=2)
-
-        reeval_dir = os.path.join(args.output_dir, "reeval")
-        if os.path.exists(reeval_dir):
-            shutil.rmtree(reeval_dir)
-        print(f"Re-evaluation done. Best config index {best_config_idx}, seed {best_seed}, mean_rmse={mean_rmse[best_config_idx]:.4f}")
+        # Re-evaluate top trials with multiple seeds, then save best run
+        n_gpus_reeval = min(args.reeval_n_gpus, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+        if n_gpus_reeval <= 0:
+            n_gpus_reeval = 1
+        storage_url_reeval = None
+        if n_gpus_reeval > 1:
+            storage_path_reeval = os.path.abspath(os.path.join(args.output_dir, "optuna_study.db"))
+            storage_url_reeval = f"sqlite:///{storage_path_reeval}"
+        run_reeval_from_study(study, args, train_ds, val_ds, head_params, tokenizer, scaler, n_gpus_reeval=n_gpus_reeval, storage_url=storage_url_reeval)
 
     else:
         # use command-line specified hyperparameters
