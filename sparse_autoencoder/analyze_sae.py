@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MaxAbsScaler
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
@@ -37,6 +37,9 @@ REPORT_DATA = {
     'feature_analyses': [],
     'detailed_features': {}  # Store detailed analysis for top/bottom features
 }
+
+# Normalized score at or below this value is treated as non-firing in score_tables.
+DEFAULT_SCORE_FIRING_THRESHOLD = 0.05
 
 
 def parse_arguments():
@@ -54,7 +57,7 @@ def parse_arguments():
                         default='/data3/taihei/matsunaga-repos/interPLM/interplm/nbthermo/nbthermo_embedding_sparse_ssft-sft_8m',
                         help='Directory containing sparse activations')
     parser.add_argument('--tm-data', type=str,
-                        default='/data3/taihei/matsunaga-repos/vhh_up/data/tempro/vhh_tm_dataset.csv',
+                        default='/data3/taihei/matsunaga-repos/nanobody-thermostability-sae/data/nbbench/thermo-seq/vhh_thermo_seq.csv',
                         help='Path to TM dataset CSV')
     
     # Model parameters
@@ -70,6 +73,10 @@ def parse_arguments():
     # Feature analysis
     parser.add_argument('--feature-indices', type=int, nargs='+', default=[1688, 1677],
                         help='Feature indices to analyze in detail')
+    parser.add_argument('--tm-extreme-fraction', type=float, default=0.2,
+                        help='Top/bottom fraction of sequences by Tm for score-table AHO mean profile')
+    parser.add_argument('--score-firing-threshold', type=float, default=DEFAULT_SCORE_FIRING_THRESHOLD,
+                        help='Score positions at or below this value are omitted from score_tables (non-firing)')
     
     # Output
     parser.add_argument('--output-dir', type=str, default='./output',
@@ -98,7 +105,7 @@ def load_data(data_dir, sparse_dir, tm_data_path, layer):
     print(f"Loading TM data from: {tm_data_path}")
     df = pd.read_csv(tm_data_path)
     
-    y = df['tm'].values
+    y = df['label'].values
     print(f"データ数: {len(y)}, Tm範囲: {y.min():.1f} - {y.max():.1f}")
     
     print(f"Loading dense activations from: {data_dir}")
@@ -212,52 +219,81 @@ def analyze_sae_sparsity(sparse_before_pooling, output_dir):
     return firing_rates, feature_sparsity
 
 
-def train_and_evaluate_model(X_dense, X_sparse, y, test_size, random_state, cv_folds, output_dir):
-    """Train RidgeCV models and evaluate performance"""
+def train_and_evaluate_model(X_dense, X_sparse, y, df, tm_data_path, cv_folds, output_dir,
+                             test_size=0.2, random_state=42):
+    """Train RidgeCV models and evaluate performance (nbbench train/test split when available)."""
     print("=== Training Models ===")
-    
-    # Train/test split
-    X_dense_train, X_dense_test, y_train, y_test = train_test_split(
-        X_dense, y, test_size=test_size, random_state=random_state
-    )
-    X_sparse_train, X_sparse_test, _, _ = train_test_split(
-        X_sparse, y, test_size=test_size, random_state=random_state
-    )
-    
-    # Feature scaling
+
+    thermo_dir = Path(tm_data_path).parent
+    train_csv = thermo_dir / "train.csv"
+    test_csv = thermo_dir / "test.csv"
+
+    if train_csv.is_file() and test_csv.is_file():
+        train_df = pd.read_csv(train_csv)
+        test_df = pd.read_csv(test_csv)
+        seq_to_idx = {seq: i for i, seq in enumerate(df["seq"])}
+        train_idx = np.array([seq_to_idx[s] for s in train_df["seq"]], dtype=int)
+        test_idx = np.array([seq_to_idx[s] for s in test_df["seq"]], dtype=int)
+        X_dense_train = X_dense[train_idx]
+        X_dense_test = X_dense[test_idx]
+        X_sparse_train = X_sparse[train_idx]
+        X_sparse_test = X_sparse[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+        print(f"Train n={len(train_idx)}, Test n={len(test_idx)} (nbbench split, val excluded)")
+    else:
+        print(
+            f"Warning: {train_csv.name} / {test_csv.name} not found under {thermo_dir}; "
+            "using random train_test_split."
+        )
+        X_dense_train, X_dense_test, y_train, y_test = train_test_split(
+            X_dense, y, test_size=test_size, random_state=random_state
+        )
+        X_sparse_train, X_sparse_test, _, _ = train_test_split(
+            X_sparse, y, test_size=test_size, random_state=random_state
+        )
+
     scaler_dense = MaxAbsScaler()
     scaler_sparse = MaxAbsScaler()
-    
+
     X_dense_train_scaled = scaler_dense.fit_transform(X_dense_train)
     X_dense_test_scaled = scaler_dense.transform(X_dense_test)
     X_sparse_train_scaled = scaler_sparse.fit_transform(X_sparse_train)
     X_sparse_test_scaled = scaler_sparse.transform(X_sparse_test)
-    
-    # RidgeCV training
+
     alphas = np.logspace(-1, 4, 30)
-    
+
     ridgecv_dense = RidgeCV(alphas=alphas, cv=cv_folds, scoring="neg_root_mean_squared_error")
     ridgecv_sparse = RidgeCV(alphas=alphas, cv=cv_folds, scoring="neg_root_mean_squared_error")
-    
+
     ridgecv_dense.fit(X_dense_train_scaled, y_train)
     ridgecv_sparse.fit(X_sparse_train_scaled, y_train)
-    
-    print(f"Dense: 最適α={ridgecv_dense.alpha_}")
-    print(f"Sparse: 最適α={ridgecv_sparse.alpha_}")
-    
-    # Evaluation
+
+    print(f"Dense: optimal α={ridgecv_dense.alpha_}")
+    print(f"Sparse: optimal α={ridgecv_sparse.alpha_}")
+
     y_pred_dense = ridgecv_dense.predict(X_dense_test_scaled)
     y_pred_sparse = ridgecv_sparse.predict(X_sparse_test_scaled)
-    
+
     def evaluate_model(y_true, y_pred, name):
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
         r2 = r2_score(y_true, y_pred)
         mae = mean_absolute_error(y_true, y_pred)
         pearson = pearsonr(y_true, y_pred)[0]
-        print(f"{name}: RMSE={rmse:.3f}, R²={r2:.3f}, MAE={mae:.3f}, Pearson={pearson:.3f}")
-        return {'rmse': rmse, 'r2': r2, 'mae': mae, 'pearson': pearson}
-    
-    print("=== 性能比較 ===")
+        spearman = spearmanr(y_true, y_pred)[0]
+        print(
+            f"{name}: RMSE={rmse:.3f}, R²={r2:.3f}, MAE={mae:.3f}, "
+            f"Pearson={pearson:.3f}, Spearman={spearman:.3f}"
+        )
+        return {
+            'rmse': rmse,
+            'r2': r2,
+            'mae': mae,
+            'pearson': pearson,
+            'spearman': spearman,
+        }
+
+    print("=== Performance evaluation ===")
     dense_metrics = evaluate_model(y_test, y_pred_dense, "Dense")
     sparse_metrics = evaluate_model(y_test, y_pred_sparse, "Sparse")
     
@@ -280,33 +316,43 @@ def train_and_evaluate_model(X_dense, X_sparse, y, test_size, random_state, cv_f
     }
 
 
-def create_joint_plot(tm_values, predictions, metrics, output_dir, filename, 
-                     figsize=(2, 2), scatter_size=10, tick_size=5, label_size=6, stats_size=6):
-    """Create joint plot for prediction results"""
+def create_joint_plot(tm_values, predictions, metrics,
+                      title=None,
+                      title_size=8,
+                      figsize=(2, 2),
+                      scatter_size=10,
+                      tick_size=5,
+                      label_size=6,
+                      stats_size=6,
+                      linespacing=1.5):
+    """Create joint plot for prediction results (matches analyze_SAE_feature.ipynb)."""
     rmse = metrics['rmse']
     r2 = metrics['r2']
     mae = metrics['mae']
-    pearson = metrics['pearson']
-    
+    spearman = metrics['spearman']
+
     sns.set_style("whitegrid", {"grid.color": "0.9"})
     BORDER_COLOR = 'black'
     line_width = 0.3
-    
-    jp = sns.jointplot(x=tm_values, y=predictions, 
-                      kind="scatter", 
-                      height=figsize[0],
-                      color="steelblue", 
-                      edgecolor="w",
-                      s=scatter_size)
-    
+
+    jp = sns.jointplot(
+        x=tm_values,
+        y=predictions,
+        kind="scatter",
+        height=figsize[0],
+        color="steelblue",
+        edgecolor="w",
+        s=scatter_size,
+    )
+
     jp.ax_marg_x.set_position([0.05, 0.82, 0.7, 0.1])
     jp.ax_marg_y.set_position([0.82, 0.05, 0.1, 0.7])
     jp.ax_joint.set_position([0.05, 0.05, 0.7, 0.7])
-    
-    plot_min, plot_max = 38, 99
+
+    plot_min, plot_max = 25, 99
     jp.ax_joint.set_xlim(plot_min, plot_max)
     jp.ax_joint.set_ylim(plot_min, plot_max)
-    
+
     for spine in jp.ax_joint.spines.values():
         if spine in [jp.ax_joint.spines['top'], jp.ax_joint.spines['right']]:
             spine.set_visible(False)
@@ -314,7 +360,7 @@ def create_joint_plot(tm_values, predictions, metrics, output_dir, filename,
             spine.set_visible(True)
             spine.set_color(BORDER_COLOR)
             spine.set_linewidth(line_width)
-    
+
     for spine in jp.ax_marg_x.spines.values():
         if spine in [jp.ax_marg_x.spines['top'], jp.ax_marg_x.spines['left'], jp.ax_marg_x.spines['right']]:
             spine.set_visible(False)
@@ -324,7 +370,7 @@ def create_joint_plot(tm_values, predictions, metrics, output_dir, filename,
             spine.set_linewidth(line_width)
     jp.ax_marg_x.grid(False)
     jp.ax_marg_x.tick_params(axis='x', direction="out", bottom=True, length=2, width=line_width)
-    
+
     for spine in jp.ax_marg_y.spines.values():
         if spine in [jp.ax_marg_y.spines['top'], jp.ax_marg_y.spines['bottom'], jp.ax_marg_y.spines['right']]:
             spine.set_visible(False)
@@ -334,33 +380,54 @@ def create_joint_plot(tm_values, predictions, metrics, output_dir, filename,
             spine.set_linewidth(line_width)
     jp.ax_marg_y.grid(False)
     jp.ax_marg_y.tick_params(axis='y', direction="out", left=True, length=2, width=line_width)
-    
-    jp.ax_joint.set_xticks([40, 50, 60, 70, 80, 90])
-    jp.ax_joint.tick_params(axis='both', direction="out", bottom=True, left=True, length=3, width=line_width, labelsize=tick_size)
-    
+
+    jp.ax_joint.set_xticks([30, 40, 50, 60, 70, 80, 90])
+    jp.ax_joint.tick_params(
+        axis='both',
+        direction="out",
+        bottom=True,
+        left=True,
+        length=3,
+        width=line_width,
+        labelsize=tick_size,
+    )
+
     jp.ax_joint.grid(False)
     jp.ax_joint.plot([plot_min, plot_max], [plot_min, plot_max], "r--", lw=0.3)
-    
+
     jp.set_axis_labels("True Tm (°C)", "Predicted Tm (°C)", fontsize=label_size)
-    
-    stats_text = (f"Pearson: {pearson:.3f}\n"
-                 f"R²: {r2:.3f}\n"
-                 f"RMSE: {rmse:.3f}\n"
-                 f"MAE: {mae:.3f}")
-    
-    jp.ax_joint.text(0.05, 0.95, stats_text,
-                     transform=jp.ax_joint.transAxes,
-                     fontsize=stats_size,
-                     verticalalignment="top",
-                     linespacing=1.5,
-                     bbox=dict(boxstyle="round",
-                              facecolor="white",
-                              alpha=0.5))
-    
-    save_path = os.path.join(output_dir, 'figure', filename)
-    jp.savefig(save_path, dpi=350, bbox_inches='tight')
+
+    if title:
+        jp.fig.suptitle(title, fontsize=title_size)
+
+    stats_text = (
+        f"Spearman: {spearman:.3f}\n"
+        f"R²: {r2:.3f}\n"
+        f"RMSE: {rmse:.3f}\n"
+        f"MAE: {mae:.3f}"
+    )
+
+    jp.ax_joint.text(
+        0.05,
+        0.95,
+        stats_text,
+        transform=jp.ax_joint.transAxes,
+        fontsize=stats_size,
+        verticalalignment="top",
+        linespacing=linespacing,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.5),
+    )
+
+    return jp
+
+
+def save_joint_plot(jp, output_dir, filename, dpi=350):
+    """Save a joint plot to output_dir/figure/ (matches notebook save_plot pattern)."""
+    fig_dir = os.path.join(output_dir, 'figure')
+    os.makedirs(fig_dir, exist_ok=True)
+    save_path = os.path.join(fig_dir, filename)
+    jp.savefig(save_path, dpi=dpi, format="png", bbox_inches='tight')
     plt.close()
-    
     return save_path
 
 
@@ -485,11 +552,11 @@ def analyze_specific_features(sparse_before_pooling, df, feature_indices, output
             protein_feature_strengths.append({
                 'protein_id': i,
                 'mean_activation': mean_activation,
-                'tm': df.iloc[i]['tm']
+                'label': df.iloc[i]['label']
             })
         
         mean_activations = [stats['mean_activation'] for stats in protein_feature_strengths]
-        tm_values = [stats['tm'] for stats in protein_feature_strengths]
+        tm_values = [stats['label'] for stats in protein_feature_strengths]
         correlation = np.corrcoef(mean_activations, tm_values)[0, 1]
         
         correlations[feat_idx] = correlation
@@ -517,7 +584,7 @@ def normalize_activations(sparse_before_pooling, df, feature_idx):
         protein_feature_strengths.append({
             'protein_id': i,
             'mean_activation': mean_activation,
-            'tm': df.iloc[i]['tm']
+            'label': df.iloc[i]['label']
         })
         mean_activations.append(mean_activation)
     
@@ -551,10 +618,52 @@ def build_ungapped_to_aho_map(seq_aho):
     return mapping
 
 
+def build_aho_to_ungapped_resi(seq_aho):
+    """
+    For one gapped AHO string, map AHO column (1-based) to ungapped residue index (1-based).
+    Columns where this sequence has a gap are absent from the returned dict.
+    """
+    ungapped_to_aho = build_ungapped_to_aho_map(seq_aho)
+    aho_to_resi = {}
+    for u_idx, aho_1based in enumerate(ungapped_to_aho):
+        aho_to_resi[int(aho_1based)] = u_idx + 1
+    return aho_to_resi
+
+
+def build_aho_activation_matrix(sparse_before_pooling, df, feature_idx, aho_len=149):
+    """
+    Stack AHO-aligned activations for one SAE feature across all proteins.
+    Row i matches df.iloc[i] / sparse_before_pooling[i].
+
+    Returns:
+        M: (N, aho_len) float array
+        meta: list of dicts with keys 'id' (row index), 'label' (Tm)
+    """
+    num_proteins = len(sparse_before_pooling)
+    rows = []
+    meta = []
+    for i in range(num_proteins):
+        protein_tensor = sparse_before_pooling[i]
+        activations = protein_tensor[:, feature_idx].numpy()
+        tm_val = df.iloc[i]['label']
+        aho_gapped_sequence = df.iloc[i]['sequence_aho']
+        ungapped_to_aho = build_ungapped_to_aho_map(aho_gapped_sequence)
+        aho_aligned_activations = np.zeros(aho_len)
+        L = min(len(activations), len(ungapped_to_aho))
+        for u_idx in range(L):
+            aho_pos = ungapped_to_aho[u_idx] - 1
+            if aho_pos < aho_len:
+                aho_aligned_activations[aho_pos] = activations[u_idx]
+        rows.append(aho_aligned_activations)
+        meta.append({'id': i, 'label': tm_val})
+    M = np.stack(rows, axis=0)
+    return M, meta
+
+
 def create_tm_correlation_plot(protein_feature_strengths, feature_idx, output_dir):
     """Create correlation plot between mean activation and Tm"""
     mean_activations = [p['mean_activation'] for p in protein_feature_strengths]
-    tm_values = [p['tm'] for p in protein_feature_strengths]
+    tm_values = [p['label'] for p in protein_feature_strengths]
     
     correlation = np.corrcoef(mean_activations, tm_values)[0, 1]
     
@@ -582,35 +691,18 @@ def create_aho_heatmaps(sparse_before_pooling, df, feature_idx, output_dir,
     using a seaborn heatmap to keep figure height manageable.
     Returns both the heatmap path and the top 5 mean-activation AHO positions.
     """
-    # Build protein data with AHO alignment
-    all_protein_data = []
-    num_proteins = len(sparse_before_pooling)
-    
-    for i in range(num_proteins):
-        protein_tensor = sparse_before_pooling[i]
-        activations = protein_tensor[:, feature_idx].numpy()
-        
-        tm_val = df.iloc[i]['tm']
-        aho_gapped_sequence = df.iloc[i]['sequence_aho']
-        
-        # Build AHO alignment
-        ungapped_to_aho = build_ungapped_to_aho_map(aho_gapped_sequence)
-        aho_aligned_activations = np.zeros(aho_len)
-        
-        L = min(len(activations), len(ungapped_to_aho))
-        for u_idx in range(L):
-            aho_pos = ungapped_to_aho[u_idx] - 1
-            if aho_pos < aho_len:
-                aho_aligned_activations[aho_pos] = activations[u_idx]
-        
-        all_protein_data.append({
-            'id': i,
-            'tm': tm_val,
-            'aho_aligned_activations': aho_aligned_activations
-        })
-    
-    # Sort by Tm (high to low)
-    all_protein_data.sort(key=lambda x: x['tm'], reverse=True)
+    M, meta = build_aho_activation_matrix(
+        sparse_before_pooling, df, feature_idx, aho_len=aho_len
+    )
+    order = np.argsort([-m['label'] for m in meta])
+    all_protein_data = [
+        {
+            'id': meta[j]['id'],
+            'label': meta[j]['label'],
+            'aho_aligned_activations': M[j],
+        }
+        for j in order
+    ]
     
     # Create single heatmap with all sequences
     M = np.array([p['aho_aligned_activations'] for p in all_protein_data])
@@ -630,7 +722,7 @@ def create_aho_heatmaps(sparse_before_pooling, df, feature_idx, output_dir,
     heatmap_df = pd.DataFrame(
         M,
         columns=[f"AHO{j+1}" for j in range(aho_len)],
-        index=[f"ID {p['id']} (Tm={p['tm']:.1f}°C)" for p in all_protein_data]
+        index=[f"ID {p['id']} (Tm={p['label']:.1f}°C)" for p in all_protein_data]
     )
     
     # Figure size fixed to keep output manageable
@@ -677,80 +769,114 @@ def create_aho_heatmaps(sparse_before_pooling, df, feature_idx, output_dir,
     return save_path, top_positions
 
 
-def extract_firing_positions(sparse_before_pooling, df, feature_idx, output_dir, is_positive_weight=True):
+def extract_firing_positions(
+    sparse_before_pooling,
+    df,
+    feature_idx,
+    output_dir,
+    is_positive_weight=True,
+    tm_extreme_fraction=0.2,
+    aho_len=149,
+    score_firing_threshold=DEFAULT_SCORE_FIRING_THRESHOLD,
+):
     """
-    Extract firing positions for high Tm or low Tm sequences based on feature weight
-    
+    Aggregate firing positions over the top or bottom Tm fraction of sequences.
+
+    Mean activation is computed per AHO position across the selected group, then
+    scores match the previous convention: ReLU on the mean profile, divided by its max.
+
+    ``resi`` follows the legacy convention: ungapped residue index (1-based) for the single
+    highest-Tm sequence (positive weight) or lowest-Tm sequence (negative weight), at each
+    ``aho_pos``. Where that reference sequence has a gap, ``resi`` is empty in the CSV.
+
     Args:
-        is_positive_weight: If True, analyze only high Tm sequence
-                           If False, analyze only low Tm sequence
+        is_positive_weight: If True, use highest-Tm fraction; if False, lowest-Tm fraction.
+        tm_extreme_fraction: Fraction of sequences in each tail (e.g. 0.2 for top/bottom 20%).
+        score_firing_threshold: Positions with score <= this value are dropped from the CSV.
     """
-    # Find high and low Tm sequences
-    tm_values = df['tm'].values
-    high_tm_idx = np.argmax(tm_values)
-    low_tm_idx = np.argmin(tm_values)
-    
-    results = []
-    
-    # Choose which sequence to analyze based on weight sign
+    M, meta = build_aho_activation_matrix(
+        sparse_before_pooling, df, feature_idx, aho_len=aho_len
+    )
+    tm_values = np.array([m['label'] for m in meta], dtype=float)
+    N = len(tm_values)
+    k = max(1, int(np.ceil(tm_extreme_fraction * N)))
+    pct_int = int(round(tm_extreme_fraction * 100))
+
     if is_positive_weight:
-        # Positive weight features: only high Tm
-        sequences_to_analyze = [(high_tm_idx, 'high')]
+        group_idx = np.argsort(-tm_values)[:k]
+        label = f'top{pct_int}pct'
+        tm_side = 'high'
+        filename_suffix = f'top{pct_int}pct_hightm'
     else:
-        # Negative weight features: only low Tm
-        sequences_to_analyze = [(low_tm_idx, 'low')]
-    
-    for idx, label in sequences_to_analyze:
-        protein_tensor = sparse_before_pooling[idx]
-        activations = protein_tensor[:, feature_idx].numpy()
-        sequence = df.iloc[idx]['sequence_aho_ungapped']
-        tm_val = df.iloc[idx]['tm']
-        
-        # Normalize to max=1
-        acts_pos = np.clip(activations, a_min=0.0, a_max=None)
-        max_pos = acts_pos.max() if acts_pos.size > 0 else 0.0
-        if max_pos > 0:
-            scores = acts_pos / max_pos
-        else:
-            scores = np.zeros_like(acts_pos)
-        
-        # Create DataFrame
-        df_scores = pd.DataFrame({
-            "resi": np.arange(1, len(sequence) + 1, dtype=int),
-            "aa": list(sequence),
-            "score": scores.astype(float),
-            "raw_activation": activations.astype(float),
-        })
-        
-        # Keep only score > 0
-        df_scores = df_scores[df_scores["score"] > 0].reset_index(drop=True)
-        
-        # Save to CSV
-        filename = f'scores_feature{feature_idx}_seqid{idx}_{label}tm.csv'
-        out_csv = os.path.join(output_dir, 'score_tables', filename)
-        df_scores.to_csv(out_csv, index=False)
-        
-        results.append({
-            'label': label,
-            'tm': tm_val,
-            'seq_id': idx,
-            'csv_path': filename,
-            'num_firing': len(df_scores)
-        })
-    
-    return results
+        group_idx = np.argsort(tm_values)[:k]
+        label = f'bottom{pct_int}pct'
+        tm_side = 'low'
+        filename_suffix = f'bottom{pct_int}pct_lowtm'
+
+    mean_activation = M[group_idx].mean(axis=0)
+    acts_pos = np.clip(mean_activation, a_min=0.0, a_max=None)
+    max_pos = acts_pos.max() if acts_pos.size > 0 else 0.0
+    if max_pos > 0:
+        scores = acts_pos / max_pos
+    else:
+        scores = np.zeros_like(acts_pos)
+
+    ref_idx = int(np.argmax(tm_values) if is_positive_weight else np.argmin(tm_values))
+    ref_seq_aho = df.iloc[ref_idx]['sequence_aho']
+    aho_to_resi = build_aho_to_ungapped_resi(ref_seq_aho)
+
+    pos_1based = np.arange(1, aho_len + 1, dtype=int)
+    resi_vals = [
+        aho_to_resi[int(ap)] if int(ap) in aho_to_resi else pd.NA
+        for ap in pos_1based
+    ]
+    df_scores = pd.DataFrame({
+        'resi': pd.array(resi_vals, dtype=pd.Int64Dtype()),
+        'aho_pos': pos_1based,
+        'mean_activation': mean_activation.astype(float),
+        'score': scores.astype(float),
+        'raw_activation': mean_activation.astype(float),
+    })
+    df_scores = df_scores[df_scores['score'] > score_firing_threshold].reset_index(drop=True)
+
+    filename = f'scores_feature{feature_idx}_{filename_suffix}.csv'
+    out_csv = os.path.join(output_dir, 'score_tables', filename)
+    df_scores.to_csv(out_csv, index=False)
+
+    group_tms = tm_values[group_idx]
+    return [{
+        'label': label,
+        'tm_side': tm_side,
+        'tm_min': float(group_tms.min()),
+        'tm_max': float(group_tms.max()),
+        'tm_mean': float(group_tms.mean()),
+        'n_sequences': int(k),
+        'seq_ids': group_idx.astype(int).tolist(),
+        'csv_path': filename,
+        'num_firing': len(df_scores),
+    }]
 
 
-def analyze_feature_detailed(feature_idx, sparse_before_pooling, df, output_dir, is_positive_weight=True):
+def analyze_feature_detailed(
+    feature_idx,
+    sparse_before_pooling,
+    df,
+    output_dir,
+    is_positive_weight=True,
+    tm_extreme_fraction=0.2,
+    score_firing_threshold=DEFAULT_SCORE_FIRING_THRESHOLD,
+):
     """
     Perform detailed analysis for a single feature:
     1. Correlation plot with Tm
     2. AHO-aligned heatmap (all sequences sorted by Tm)
-    3. Firing position lists for high/low Tm sequences (based on weight sign)
+    3. Score tables from mean AHO activations over top/bottom Tm fraction (by weight sign)
     
     Args:
         is_positive_weight: If True, extract only high Tm firing positions
                            If False, extract only low Tm firing positions
+        tm_extreme_fraction: Tail fraction for score-table aggregation (e.g. 0.2).
+        score_firing_threshold: Minimum normalized score to count as firing in score_tables.
     """
     print(f"\n=== Analyzing Feature {feature_idx} ===")
     
@@ -766,7 +892,7 @@ def analyze_feature_detailed(feature_idx, sparse_before_pooling, df, output_dir,
         protein_feature_strengths.append({
             'protein_id': i,
             'mean_activation': mean_activation,
-            'tm': df.iloc[i]['tm']
+            'label': df.iloc[i]['label']
         })
     
     # 2. Create correlation plot
@@ -783,11 +909,21 @@ def analyze_feature_detailed(feature_idx, sparse_before_pooling, df, output_dir,
     print(f"  Created heatmap for all sequences sorted by Tm")
     print(f"  Top AHO positions (mean activation): {top_positions}")
     
-    # 4. Extract firing positions (only high or low based on weight)
+    # 4. Score table: mean AHO profile over top/bottom Tm fraction
     firing_results = extract_firing_positions(
-        sparse_before_pooling, df, feature_idx, output_dir, is_positive_weight=is_positive_weight
+        sparse_before_pooling,
+        df,
+        feature_idx,
+        output_dir,
+        is_positive_weight=is_positive_weight,
+        tm_extreme_fraction=tm_extreme_fraction,
+        score_firing_threshold=score_firing_threshold,
     )
-    print(f"  Extracted firing positions for {'high' if is_positive_weight else 'low'} Tm sequence")
+    print(
+        f"  Wrote score table for {firing_results[0]['n_sequences']} sequences "
+        f"({'high' if is_positive_weight else 'low'} Tm tail, fraction={tm_extreme_fraction}, "
+        f"score>{score_firing_threshold})"
+    )
     
     return {
         'feature_idx': feature_idx,
@@ -935,6 +1071,7 @@ def generate_html_report(output_dir):
                 <th>RMSE</th>
                 <th>MAE</th>
                 <th>Pearson</th>
+                <th>Spearman</th>
                 <th>Optimal α</th>
             </tr>
             <tr>
@@ -943,6 +1080,7 @@ def generate_html_report(output_dir):
                 <td>{metrics['dense']['rmse']:.3f}</td>
                 <td>{metrics['dense']['mae']:.3f}</td>
                 <td>{metrics['dense']['pearson']:.3f}</td>
+                <td>{metrics['dense']['spearman']:.3f}</td>
                 <td>{metrics['dense_alpha']:.3f}</td>
             </tr>
             <tr>
@@ -951,6 +1089,7 @@ def generate_html_report(output_dir):
                 <td>{metrics['sparse']['rmse']:.3f}</td>
                 <td>{metrics['sparse']['mae']:.3f}</td>
                 <td>{metrics['sparse']['pearson']:.3f}</td>
+                <td>{metrics['sparse']['spearman']:.3f}</td>
                 <td>{metrics['sparse_alpha']:.3f}</td>
             </tr>
         </table>
@@ -1077,22 +1216,22 @@ def generate_html_report(output_dir):
                     html_content += """
             </table>
             
-            <h5>Firing Positions</h5>
+            <h5>Score tables (mean AHO profile, Tm tail)</h5>
             <table>
                 <tr>
-                    <th>Sequence</th>
-                    <th>Tm (°C)</th>
-                    <th>Seq ID</th>
-                    <th>Firing Positions</th>
+                    <th>Group</th>
+                    <th>Tm range (°C)</th>
+                    <th>N sequences</th>
+                    <th>Firing AHO positions</th>
                     <th>CSV File</th>
                 </tr>
 """
                     for fp in feat_data['firing_positions']:
                         html_content += f"""
                 <tr>
-                    <td>{fp['label'].upper()} Tm</td>
-                    <td>{fp['tm']:.1f}</td>
-                    <td>{fp['seq_id']}</td>
+                    <td>{fp['label']} ({fp['tm_side']} Tm)</td>
+                    <td>{fp['tm_min']:.1f}–{fp['tm_max']:.1f} (mean {fp['tm_mean']:.1f})</td>
+                    <td>{fp['n_sequences']}</td>
                     <td>{fp['num_firing']}</td>
                     <td><a href="score_tables/{fp['csv_path']}">{fp['csv_path']}</a></td>
                 </tr>
@@ -1146,16 +1285,21 @@ def main():
     
     # Train and evaluate models
     model_results = train_and_evaluate_model(
-        X_dense, X_sparse, y, args.test_size, args.random_state, 
-        args.cv_folds, args.output_dir
+        X_dense, X_sparse, y, df, args.tm_data, args.cv_folds, args.output_dir,
+        test_size=args.test_size, random_state=args.random_state,
     )
-    
-    # Create joint plots
-    joint_path = create_joint_plot(
-        model_results['y_test'], model_results['y_pred_sparse'],
+
+    jp_sparse = create_joint_plot(
+        model_results['y_test'],
+        model_results['y_pred_sparse'],
         REPORT_DATA['model_metrics']['sparse'],
-        args.output_dir, 'evaluation_tm_Sparse_SAE_SFT.png'
+        figsize=(1.8, 1.8),
+        scatter_size=10,
+        tick_size=5,
+        label_size=5,
+        stats_size=5,
     )
+    joint_path = save_joint_plot(jp_sparse, args.output_dir, 'evaluation_tm_Sparse_SAE_SFT.png')
     REPORT_DATA['figures'].append({
         'path': 'figure/evaluation_tm_Sparse_SAE_SFT.png',
         'title': 'Sparse SAE Model Performance',
@@ -1197,14 +1341,18 @@ def main():
     for feat_idx in pos_features:
         feat_data = analyze_feature_detailed(
             feat_idx, sparse_before_pooling, df, args.output_dir,
-            is_positive_weight=True  # 正の重み: 高Tmのみ
+            is_positive_weight=True,
+            tm_extreme_fraction=args.tm_extreme_fraction,
+            score_firing_threshold=args.score_firing_threshold,
         )
         REPORT_DATA['detailed_features']['positive'].append(feat_data)
     
     for feat_idx in neg_features:
         feat_data = analyze_feature_detailed(
             feat_idx, sparse_before_pooling, df, args.output_dir,
-            is_positive_weight=False  # 負の重み: 低Tmのみ
+            is_positive_weight=False,
+            tm_extreme_fraction=args.tm_extreme_fraction,
+            score_firing_threshold=args.score_firing_threshold,
         )
         REPORT_DATA['detailed_features']['negative'].append(feat_data)
     
