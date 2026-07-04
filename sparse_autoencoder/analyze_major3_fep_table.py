@@ -38,7 +38,11 @@ OUTPUT_DIR  = SCRIPT_DIR / 'outputs/major3_fep_table'
 LAYER    = 6
 CV_FOLDS = 10
 
-FEP_SEQS = [217, 221, 339, 354, 443]
+# ディレクトリ名 → 表示名のマッピング
+FEP_ENTRIES = {
+    'seq274_F93Y': 'seq274',
+    'seq594_H34M': 'seq594',
+}
 
 # ddG.csv の列定義
 # col0: ungapped_pos, col1: WT_res, col2: mut_res, col3: ddG_kcal,
@@ -63,26 +67,24 @@ def reconstruct_wt(row: pd.Series) -> str:
 def load_fep_data() -> pd.DataFrame:
     """全FEP nanobodyのddG.csvを読み込み、WT配列を再構築して返す。"""
     records = []
-    for seq_id in FEP_SEQS:
-        csv_path = FEP_ROOT / f'seq{seq_id}/ionized-FEP/ddG.csv'
+    for dirname, label in FEP_ENTRIES.items():
+        csv_path = FEP_ROOT / f'{dirname}/ionized-FEP/ddG.csv'
         df = pd.read_csv(csv_path, header=None, names=COL_NAMES)
-        df['nanobody'] = f'seq{seq_id}'
+        df['nanobody'] = label
 
-        # WT配列を1行目から再構築（全行で同一のはず）
         wt_seq = reconstruct_wt(df.iloc[0])
-        # 2行目以降でも一致を確認
         for _, r in df.iterrows():
             wt_check = reconstruct_wt(r)
             assert wt_check == wt_seq, \
-                f"seq{seq_id}: WT配列が行によって一致しません\n  row: {wt_check}\n  ref: {wt_seq}"
+                f"{dirname}: WT配列が行によって一致しません"
         df['wt_seq'] = wt_seq
         records.append(df)
 
     fep_df = pd.concat(records, ignore_index=True)
-    print(f"FEPデータ: {len(fep_df)}変異 × {len(FEP_SEQS)} nanobody")
-    for seq_id in FEP_SEQS:
-        sub = fep_df[fep_df['nanobody'] == f'seq{seq_id}']
-        print(f"  seq{seq_id}: WT={sub.iloc[0]['wt_seq'][:40]}... (len={len(sub.iloc[0]['wt_seq'])})")
+    print(f"FEPデータ: {len(fep_df)}変異 × {len(FEP_ENTRIES)} nanobody")
+    for label in FEP_ENTRIES.values():
+        sub = fep_df[fep_df['nanobody'] == label]
+        print(f"  {label}: WT={sub.iloc[0]['wt_seq'][:40]}... (len={len(sub.iloc[0]['wt_seq'])})")
     return fep_df
 
 
@@ -267,7 +269,7 @@ def main():
 
     # 論文用整形テーブル（nanobody毎にWT Tmを先頭行に）
     print("\n=== nanobody毎のサマリー ===")
-    for nb in [f'seq{i}' for i in FEP_SEQS]:
+    for nb in FEP_ENTRIES.values():
         sub = result_df[result_df['nanobody'] == nb]
         if sub.empty:
             continue
