@@ -3,9 +3,8 @@
 追試1: 低配列類似度サブセット解析 (Reviewer 2 Major 1)
 
 テスト147配列に対してtrain 522配列との最大pairwise配列同一性を算出し、
-80%以下の低類似度サブセットを抽出。主要SAE特徴（|w_k|>=0.05）の
-発火パターンを高類似度群と比較し、配列類似度に依存せず共通AHo位置で
-発火することを示す。
+80%以下の低類似度サブセットを抽出。Ridge重みが正のTop10・負のTop10を
+それぞれ解析し、発火パターンが配列類似度に依存しないことを示す。
 
 実行方法（sparse_autoencoder/ ディレクトリから）:
     python analyze_major1_low_similarity.py
@@ -42,7 +41,8 @@ LAYER           = 6
 CV_FOLDS        = 10
 RANDOM_STATE    = 42
 SIM_THRESHOLD   = 0.80   # 低類似度の閾値
-TOP_N_FEATURES  = 10     # |w|上位N個を主要特徴として解析
+TOP_N_POS = 10   # 正の重み上位N個
+TOP_N_NEG = 10   # 負の重み上位N個（最も負が大きい順）
 AHO_LEN         = 149    # AHo列数
 
 
@@ -306,23 +306,30 @@ def plot_aho_heatmap_low_sim(sparse_proteins, df_low, feature_idx, weight_val):
     print(f"    ヒートマップ保存: {path}")
 
 
-def plot_summary_profile_corrs(feature_summary):
+def plot_summary_profile_corrs(pos_summary, neg_summary):
     """
-    各主要特徴について、低類似度群 vs 高類似度群のプロファイル相関 (bar chart)
+    正の重みTop10・負の重みTop10それぞれの
+    低類似度群 vs 高類似度群 プロファイル相関を2パネルで表示。
     """
-    feat_ids  = [r['feature_idx']      for r in feature_summary]
-    prof_corrs= [r['profile_pearson_r'] for r in feature_summary]
-    weights   = [r['weight']            for r in feature_summary]
-    colors    = ['crimson' if w > 0 else 'steelblue' for w in weights]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
 
-    fig, ax = plt.subplots(figsize=(max(6, len(feat_ids) * 0.5 + 1), 3.5))
-    bars = ax.bar(range(len(feat_ids)), prof_corrs, color=colors, edgecolor='white', linewidth=0.5)
-    ax.set_xticks(range(len(feat_ids)))
-    ax.set_xticklabels([str(f) for f in feat_ids], rotation=45, ha='right', fontsize=8)
-    ax.set_xlabel('SAE Feature index', fontsize=11)
-    ax.set_ylabel('Pearson r (low-sim vs high-sim profile)', fontsize=10)
-    ax.axhline(0, color='black', linewidth=0.5)
-    ax.set_title('Firing profile similarity: low-sim group vs high-sim group\nfor top SAE features (|w|≥0.05)', fontsize=10)
+    for ax, summary, color, label in [
+        (axes[0], pos_summary, 'crimson',   f'Positive-weight top {TOP_N_POS}'),
+        (axes[1], neg_summary, 'steelblue', f'Negative-weight top {TOP_N_NEG}'),
+    ]:
+        feat_ids   = [r['feature_idx']      for r in summary]
+        prof_corrs = [r['profile_pearson_r'] for r in summary]
+        ax.bar(range(len(feat_ids)), prof_corrs, color=color, edgecolor='white', linewidth=0.5)
+        ax.set_xticks(range(len(feat_ids)))
+        ax.set_xticklabels([str(f) for f in feat_ids], rotation=45, ha='right', fontsize=8)
+        ax.set_xlabel('SAE Feature index', fontsize=10)
+        ax.axhline(0, color='black', linewidth=0.5)
+        ax.set_title(label, fontsize=10)
+        ax.set_ylim(-0.2, 1.05)
+
+    axes[0].set_ylabel('Pearson r (low-sim vs high-sim profile)', fontsize=10)
+    fig.suptitle('Firing profile similarity: low-sim vs high-sim group\n'
+                 'Top SAE features by Ridge weight sign', fontsize=11)
     plt.tight_layout()
     path = OUTPUT_DIR / 'figure/summary_profile_corrs.png'
     plt.savefig(path, dpi=350, bbox_inches='tight')
@@ -389,87 +396,82 @@ def main():
     plot_similarity_distribution(max_ids)
     plot_similarity_vs_pred_error(max_ids, y_obs_test, y_pred_test)
 
-    # 6. 主要特徴の発火パターン解析（|w|上位TOP_N_FEATURES個）
-    top_feat_order = np.argsort(np.abs(sparse_weights))[-TOP_N_FEATURES:][::-1]
-    top_feat_idx   = top_feat_order
-    top_feat_w     = sparse_weights[top_feat_order]
-    print(f"\n主要特徴 (|w|上位{TOP_N_FEATURES}個): min|w|={np.abs(top_feat_w).min():.4f}")
-    print(f"  インデックス: {top_feat_idx.tolist()}")
-    print(f"  重み: {[round(float(x),4) for x in top_feat_w]}")
+    # 6. 主要特徴の発火パターン解析
+    #    正の重みTop10・負の重みTop10をそれぞれ抽出（本文解析と対応させるため）
+    pos_order = np.argsort(sparse_weights)[-TOP_N_POS:][::-1]   # 正方向上位
+    neg_order = np.argsort(sparse_weights)[:TOP_N_NEG]           # 負方向上位（最も負）
 
-    feature_summary = []
+    print(f"\n正の重みTop{TOP_N_POS}: min w={sparse_weights[pos_order].min():+.4f}")
+    print(f"  インデックス: {pos_order.tolist()}")
+    print(f"  重み: {[round(float(x),4) for x in sparse_weights[pos_order]]}")
+    print(f"\n負の重みTop{TOP_N_NEG}: max w={sparse_weights[neg_order].max():+.4f}")
+    print(f"  インデックス: {neg_order.tolist()}")
+    print(f"  重み: {[round(float(x),4) for x in sparse_weights[neg_order]]}")
 
-    # vhh_thermo_seq.csv上のインデックスが必要なので df_low/df_high の _global_idx を使う
-    # df_testのインデックスをdf全体のglobal_idxに変換するためのマッピング
-    for feat_idx, feat_w in zip(top_feat_idx, top_feat_w):
-        print(f"\n  Feature {feat_idx} (w={feat_w:+.4f}) 解析中...")
+    # train の mean profile は特徴ごとに計算するので先にdf_train_subを用意
+    df_train_sub = df.iloc[train_idx].copy().reset_index(drop=True)
 
-        # 低類似度群のAHo発火行列
-        low_aho  = build_aho_activation_matrix(sparse_proteins, df_low,  feat_idx)   # (n_low, AHO_LEN)
-        high_aho = build_aho_activation_matrix(sparse_proteins, df_high, feat_idx)   # (n_high, AHO_LEN)
+    def safe_pearsonr(a, b):
+        if np.std(a) == 0 or np.std(b) == 0:
+            return np.nan
+        return pearsonr(a, b)[0]
 
-        mean_low  = low_aho.mean(axis=0)
-        mean_high = high_aho.mean(axis=0)
+    def analyze_feature_group(feat_indices, feat_weights, group_label):
+        """特徴グループ1件ずつ解析してサマリーリストを返す"""
+        summary = []
+        for feat_idx, feat_w in zip(feat_indices, feat_weights):
+            print(f"\n  [{group_label}] Feature {feat_idx} (w={feat_w:+.4f}) 解析中...")
 
-        # プロファイル間Pearson相関
-        r_profile, _ = pearsonr(mean_low, mean_high)
-        print(f"    低類似度 vs 高類似度 プロファイルPearson r={r_profile:.4f}")
+            low_aho  = build_aho_activation_matrix(sparse_proteins, df_low,  feat_idx)
+            high_aho = build_aho_activation_matrix(sparse_proteins, df_high, feat_idx)
+            mean_low  = low_aho.mean(axis=0)
+            mean_high = high_aho.mean(axis=0)
 
-        # 各testシーケンスのプロファイル vs 全train平均との比較
-        # train上の全配列で mean profile を計算
-        df_train_sub = df.iloc[train_idx].copy().reset_index(drop=True)
-        train_aho = build_aho_activation_matrix(sparse_proteins, df_train_sub, feat_idx)
-        mean_train = train_aho.mean(axis=0)
+            r_profile, _ = pearsonr(mean_low, mean_high)
+            print(f"    低類似度 vs 高類似度 プロファイルPearson r={r_profile:.4f}")
 
-        # 全testシーケンスのper-sequence profilre vs train mean
-        all_test_aho = build_aho_activation_matrix(sparse_proteins, df_test, feat_idx)
-        def safe_pearsonr(a, b):
-            if np.std(a) == 0 or np.std(b) == 0:
-                return np.nan
-            return pearsonr(a, b)[0]
+            train_aho  = build_aho_activation_matrix(sparse_proteins, df_train_sub, feat_idx)
+            mean_train = train_aho.mean(axis=0)
+            all_test_aho = build_aho_activation_matrix(sparse_proteins, df_test, feat_idx)
+            per_seq_corr = np.array([
+                safe_pearsonr(all_test_aho[i], mean_train)
+                for i in range(len(df_test))
+            ])
 
-        per_seq_corr = np.array([
-            safe_pearsonr(all_test_aho[i], mean_train)
-            for i in range(len(df_test))
-        ])
+            plot_firing_profile_comparison(low_aho, high_aho, feat_idx, feat_w)
+            plot_similarity_vs_profile_corr(max_ids, per_seq_corr, feat_idx)
+            if n_low >= 2:
+                plot_aho_heatmap_low_sim(sparse_proteins, df_low, feat_idx, feat_w)
 
-        # 図: 低類似度群 vs 高類似度群のプロファイル比較
-        r_val = plot_firing_profile_comparison(low_aho, high_aho, feat_idx, feat_w)
+            top5_aho_low  = np.argsort(mean_low)[-5:][::-1]  + 1
+            top5_aho_high = np.argsort(mean_high)[-5:][::-1] + 1
+            print(f"    低類似度群 top-5 AHo位置: {top5_aho_low.tolist()}")
+            print(f"    高類似度群 top-5 AHo位置: {top5_aho_high.tolist()}")
 
-        # 図: 各testシーケンスの max_identity vs プロファイル相関
-        plot_similarity_vs_profile_corr(max_ids, per_seq_corr, feat_idx)
+            summary.append({
+                'feature_idx':            int(feat_idx),
+                'weight':                 float(feat_w),
+                'weight_sign':            'positive' if feat_w > 0 else 'negative',
+                'profile_pearson_r':      float(r_profile),
+                'mean_low_sim_max_act':   float(mean_low.max()),
+                'mean_high_sim_max_act':  float(mean_high.max()),
+                'top5_aho_low':           ','.join(map(str, top5_aho_low.tolist())),
+                'top5_aho_high':          ','.join(map(str, top5_aho_high.tolist())),
+            })
+        return summary
 
-        # 低類似度サブセットのAHoヒートマップ（n_low>=2のとき描画）
-        if n_low >= 2:
-            plot_aho_heatmap_low_sim(sparse_proteins, df_low, feat_idx, feat_w)
+    print(f"\n=== 正の重みTop{TOP_N_POS} 解析 ===")
+    pos_summary = analyze_feature_group(pos_order, sparse_weights[pos_order], 'pos')
 
-        # 低類似度群の上位5 AHo発火位置
-        top5_aho_low = np.argsort(mean_low)[-5:][::-1] + 1  # 1-based
-        top5_act_low = mean_low[top5_aho_low - 1]
-        # 高類似度群の上位5 AHo発火位置
-        top5_aho_high = np.argsort(mean_high)[-5:][::-1] + 1
-        top5_act_high = mean_high[top5_aho_high - 1]
+    print(f"\n=== 負の重みTop{TOP_N_NEG} 解析 ===")
+    neg_summary = analyze_feature_group(neg_order, sparse_weights[neg_order], 'neg')
 
-        print(f"    低類似度群 top-5 AHo位置: {top5_aho_low.tolist()}")
-        print(f"    高類似度群 top-5 AHo位置: {top5_aho_high.tolist()}")
-
-        feature_summary.append({
-            'feature_idx':       int(feat_idx),
-            'weight':            float(feat_w),
-            'profile_pearson_r': float(r_profile),
-            'mean_low_sim_max_activation':  float(mean_low.max()),
-            'mean_high_sim_max_activation': float(mean_high.max()),
-            'top5_aho_low':  ','.join(map(str, top5_aho_low.tolist())),
-            'top5_aho_high': ','.join(map(str, top5_aho_high.tolist())),
-        })
-
-    # 7. サマリー図
+    # 7. サマリー図（2パネル）
     print("\nサマリー図作成中...")
-    if feature_summary:
-        plot_summary_profile_corrs(feature_summary)
+    plot_summary_profile_corrs(pos_summary, neg_summary)
 
     # サマリーテーブル保存
-    df_summary = pd.DataFrame(feature_summary)
+    df_summary = pd.DataFrame(pos_summary + neg_summary)
     df_summary.to_csv(OUTPUT_DIR / 'tables/feature_profile_summary.csv', index=False)
 
     # 8. 低類似度群の予測性能（参考）
