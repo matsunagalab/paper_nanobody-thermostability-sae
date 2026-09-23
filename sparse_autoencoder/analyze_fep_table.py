@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-追試3: FEP–SAE予測Tm比較テーブル (Reviewer 2 Major 3)
+FEP–SAE予測Tm比較テーブル (Table 1)
 
 既存FEP計算のΔΔGと、SAE Ridge回帰モデルによる予測ΔTmを対応づけたテーブルを生成する。
+本文Table 1（3 nanobody × 9変異のFEP検証結果）の元データ。
 
-FEP nanobody (seq217,221,339,354,443) はvhh_thermo_seq.csvに含まれないため：
+FEP nanobody (seq274, seq594, seq1) はvhh_thermo_seq.csvに変異配列が含まれないため：
   1. ddG.csvの変異配列から1残基を元に戻してWT配列を再構築
   2. WT+変異配列に対してESM-2 SFT + SAEで埋め込みを生成
   3. nbbench訓練データでfit したMaxAbsScaler+RidgeCVで予測Tmを計算
 
+生成物:
+    fep_sae_comparison_table.csv -- Table 1の元データ（Tm_pred WT/mut列を含むフルカラム）
+
 実行方法（sparse_autoencoder/ ディレクトリから）:
-    python analyze_major3_fep_table.py
+    python analyze_fep_table.py
 """
 
 from pathlib import Path
@@ -33,7 +37,7 @@ TM_DATA     = REPO_ROOT / 'data/nbbench/thermo-seq/vhh_thermo_seq.csv'
 TRAIN_CSV   = REPO_ROOT / 'data/nbbench/thermo-seq/train.csv'
 ESM_WEIGHTS = REPO_ROOT / 'supervised_finetuning/models/sft_esm2_8m_optuna/encoder/converted_model.pt'
 SAE_WEIGHTS = SCRIPT_DIR / 'models/sft_8m_100k/expansion_32_lr_9e-5_l1_7e-2/layer_6/ae.pt'
-OUTPUT_DIR  = SCRIPT_DIR / 'outputs/major3_fep_table'
+OUTPUT_DIR  = SCRIPT_DIR / 'outputs/fep_table'
 
 LAYER    = 6
 CV_FOLDS = 10
@@ -42,6 +46,7 @@ CV_FOLDS = 10
 FEP_ENTRIES = {
     'seq274_F93Y': 'seq274',
     'seq594_H34M': 'seq594',
+    'seq1':        'seq1',
 }
 
 # ddG.csv の列定義

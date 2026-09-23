@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-追試3: FEP–SAE比較の論文用テーブル図生成
+FEP–SAE比較テーブル図 (Table 1) 生成
 
-シンプルな学術論文スタイルのテーブル（色なし・最小限の罫線）。
+analyze_fep_table.py が出力する fep_sae_comparison_table.csv を、シンプルな
+学術論文スタイルのテーブル画像（色なし・最小限の罫線）としてレンダリングする。
+本文 Table 1 として採用された図。
+
+生成物:
+    figure/fep_table_figure.png -- Table 1 の画像（Nanobody, AHo position, Mutation,
+                                    ddG_FEP, ddTm_pred の5列。Tm_pred WT/mut列は
+                                    紙面の都合で図には含めず、元データCSVにのみ保持）
 
 実行方法（sparse_autoencoder/ ディレクトリから）:
-    python analyze_major3_fep_figure.py
+    python analyze_fep_table_figure.py
 """
 
 from pathlib import Path
@@ -14,11 +21,17 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-TABLE_PATH = SCRIPT_DIR / 'outputs/major3_fep_table/fep_sae_comparison_table.csv'
-OUTPUT_DIR = SCRIPT_DIR / 'outputs/major3_fep_table/figure'
+# Times New Romanは本環境に未インストールのため、字形・字幅互換のLiberation Serifを
+# フォールバックに使用する（Times New Romanが利用可能な環境ではそちらが優先される）。
+matplotlib.rcParams['font.family'] = 'serif'
+matplotlib.rcParams['font.serif'] = [
+    'Times New Roman', 'Liberation Serif', 'Nimbus Roman', 'Times', 'DejaVu Serif'
+]
+matplotlib.rcParams['mathtext.fontset'] = 'stix'   # Times系に近い数式フォント
 
-NANOBODY_ORDER = ['seq217', 'seq221', 'seq339', 'seq354', 'seq443']
+SCRIPT_DIR = Path(__file__).parent.resolve()
+TABLE_PATH = SCRIPT_DIR / 'outputs/fep_table/fep_sae_comparison_table.csv'
+OUTPUT_DIR = SCRIPT_DIR / 'outputs/fep_table/figure'
 
 # 列定義: (ヘッダー行1, ヘッダー行2, データキー, フォーマット, 右寄せ?)
 COLUMNS = [
@@ -26,8 +39,6 @@ COLUMNS = [
     ('AHo',           'position',          'aho_pos',       '{}',     True),
     ('Mutation',      '',                  'mutation',      '{}',     False),
     ('ΔΔG$_{FEP}$',  '(kcal mol$^{-1}$)', 'ddG_fep',      '{:+.2f}', True),
-    ('Tm$_{pred}$ WT','(°C)',              'tm_pred_wt',   '{:.1f}',  True),
-    ('Tm$_{pred}$ mut','(°C)',             'tm_pred_mut',  '{:.1f}',  True),
     ('ΔTm$_{pred}$', '(°C)',              'delta_tm_pred', '{:+.2f}', True),
 ]
 
@@ -40,7 +51,7 @@ def make_table_figure(df):
     n_cols = len(COLUMNS)
 
     # 図サイズ・レイアウト定数
-    COL_W   = [1.15, 0.65, 0.75, 1.30, 1.20, 1.20, 1.10]  # 各列幅 (inch)
+    COL_W   = [1.15, 0.65, 0.75, 1.30, 1.10]  # 各列幅 (inch)
     ROW_H   = 0.30   # データ行の高さ (inch)
     HEAD_H  = 0.52   # ヘッダー行の高さ (inch)
     PAD_T   = 0.10   # 上余白

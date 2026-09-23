@@ -169,6 +169,8 @@ models/
 outputs/
 figure/
 fep/
+paper/
+CLAUDE.md
 
 # Data
 data/cif/*

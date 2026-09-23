@@ -419,6 +419,37 @@ The `sparse_autoencoder/interplm/` package contains various modules for:
 
 Refer to the `sparse_autoencoder/README.md` for more detailed information about the InterPLM toolkit.
 
+### 4. Reproducing Manuscript Figures and Tables
+
+**Environment**: `interplm` (activate with `conda activate interplm`)
+**Directory**: `sparse_autoencoder/`
+
+The scripts below each reproduce one figure or table from the manuscript. They assume
+the nbbench thermo-seq dense/sparse embeddings (Steps 3-4 above) and the SFT ESM-2 8M
+SAE (`models/sft_8m_100k/expansion_32_lr_9e-5_l1_7e-2/layer_6/ae.pt`) already exist, and
+that `data/nbbench/thermo-seq/{train,val,test,vhh_thermo_seq}.csv` are present.
+
+| Script | Output | Description |
+|---|---|---|
+| `analyze_low_similarity_subset.py` | Fig. S9, S10 | Compares SAE feature firing profiles (top/bottom 10 Ridge-weight features) between test sequences with low (≤80%) vs. high (>80%) maximum sequence identity to the training set. |
+| `analyze_feature_ablation.py` | Fig. S4 | Ablates the top-N Ridge-weight SAE features (vs. an equal number of random features) and tracks test-set RMSE/MAE/R² with bootstrap 95% confidence intervals. |
+| `analyze_bootstrap_ci.py` | Fig. 3b | Computes Spearman correlation with bootstrap 95% CIs for the pre-trained/SFT models (ESM-2 8M/35M/150M/650M) and compares them against literature baselines (NbBench). Requires the corresponding `supervised_finetuning/models/sft_esm2_{size}[_head_only]_optuna/` checkpoints. |
+| `analyze_fep_table.py` | Table 1 (data) | Reconstructs wild-type sequences from the FEP mutant sequences (`fep/{seq274_F93Y,seq594_H34M,seq1}/ionized-FEP/ddG.csv`), computes SAE-based predicted Tm for each WT/mutant pair, and pairs the result with the FEP ΔΔG values. |
+| `analyze_fep_table_figure.py` | Table 1 (image) | Renders the CSV produced by `analyze_fep_table.py` as a publication-style table image. |
+
+```bash
+conda activate interplm
+cd sparse_autoencoder
+
+python analyze_low_similarity_subset.py
+python analyze_feature_ablation.py
+python analyze_bootstrap_ci.py
+python analyze_fep_table.py
+python analyze_fep_table_figure.py
+```
+
+Each script writes its outputs under `sparse_autoencoder/outputs/<script-specific-name>/`.
+
 ### Important Notes
 
 1. **Environment Switching**: Always ensure you have activated the correct environment before running scripts:
