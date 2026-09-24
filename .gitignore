@@ -168,7 +168,29 @@ slurm-*.out
 models/
 outputs/
 figure/
-fep/
+
+# FEP: raw simulation data (structures, trajectories, setup files) is too large for
+# GitHub and is not tracked; only the ddG.csv result tables used by
+# sparse_autoencoder/analyze_fep_table.py are kept.
+fep/*
+!fep/seq274_F93Y/
+fep/seq274_F93Y/*
+!fep/seq274_F93Y/ionized-FEP/
+fep/seq274_F93Y/ionized-FEP/*
+!fep/seq274_F93Y/ionized-FEP/ddG.csv
+
+!fep/seq594_H34M/
+fep/seq594_H34M/*
+!fep/seq594_H34M/ionized-FEP/
+fep/seq594_H34M/ionized-FEP/*
+!fep/seq594_H34M/ionized-FEP/ddG.csv
+
+!fep/seq1/
+fep/seq1/*
+!fep/seq1/ionized-FEP/
+fep/seq1/ionized-FEP/*
+!fep/seq1/ionized-FEP/ddG.csv
+
 paper/
 CLAUDE.md
 
