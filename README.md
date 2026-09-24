@@ -429,6 +429,16 @@ the nbbench thermo-seq dense/sparse embeddings (Steps 3-4 above) and the SFT ESM
 SAE (`models/sft_8m_100k/expansion_32_lr_9e-5_l1_7e-2/layer_6/ae.pt`) already exist, and
 that `data/nbbench/thermo-seq/{train,val,test,vhh_thermo_seq}.csv` are present.
 
+**Note on model weights**: trained model weights (the SFT ESM-2 encoders under
+`supervised_finetuning/models/`, the SAE weights under `sparse_autoencoder/models/`,
+and the precomputed dense/sparse embedding caches under `sparse_autoencoder/interplm/`)
+are too large for GitHub and are **not** included in this repository. To run the
+scripts below, first reproduce those weights/embeddings yourself following Steps 1-4
+above (or obtain them separately). The FEP result tables
+(`fep/{seq274_F93Y,seq594_H34M,seq1}/ionized-FEP/ddG.csv`) needed by
+`analyze_fep_table.py` **are** included in the repository; the raw FEP simulation data
+(structures, trajectories, NAMD setup files) is not.
+
 | Script | Output | Description |
 |---|---|---|
 | `analyze_low_similarity_subset.py` | Fig. S9, S10 | Compares SAE feature firing profiles (top/bottom 10 Ridge-weight features) between test sequences with low (≤80%) vs. high (>80%) maximum sequence identity to the training set. |
